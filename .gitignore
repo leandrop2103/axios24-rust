@@ -1,0 +1,11 @@
+/target/
+/rea/
+**/*.rs.bk
+*.exe
+*.old
+*.tmp
+*.log
+*.scn
+preset.bin
+.DS_Store
+Thumbs.db
