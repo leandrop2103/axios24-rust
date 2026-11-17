@@ -110,6 +110,20 @@ pub fn render_app(
                     state.clear_all_solos();
                 }
             });
+            ui.add_space(2.0);
+            let lr_linked = state.is_output_stereo_linked(8);
+            if draw_pill_button(
+                ui,
+                if lr_linked { "\u{f0c1} LINK MAIN L & R (ON)" } else { "\u{f0c1} LINK MAIN L & R (OFF)" },
+                lr_linked,
+                Color32::from_rgb(0, 188, 212),
+                Vec2::new(ui.available_width(), 18.0),
+            )
+            .on_hover_text("Quando ligado, subir/descer ou editar o MAIN L ajusta o MAIN R junto (e vice-versa)")
+            .clicked()
+            {
+                state.set_output_stereo_linked(8, !lr_linked);
+            }
             ui.add_space(3.0);
             let dock_h = ui.available_height().max(120.0);
             ui.horizontal_top(|ui| {
@@ -186,6 +200,43 @@ fn render_top_bar(
                 .clicked()
             {
                 state.show_connect_modal = true;
+            }
+
+            if !matches!(state.hw_link.mode, ConnectionMode::Demo) {
+                if state.net_link_lost {
+                    if draw_pill_button(
+                        ui,
+                        "\u{f071} SINAL PERDIDO! Reconectar",
+                        true,
+                        Color32::from_rgb(231, 76, 60),
+                        Vec2::new(172.0, 22.0),
+                    )
+                    .clicked()
+                    {
+                        state.reconnect_last_hardware();
+                    }
+                } else {
+                    ui.label(
+                        RichText::new(format!("\u{f1eb} {}ms", state.net_ping_ms.max(1)))
+                            .size(10.5)
+                            .strong()
+                            .color(if state.net_ping_ms > 120 {
+                                Color32::from_rgb(243, 156, 18)
+                            } else {
+                                Color32::from_rgb(46, 204, 113)
+                            }),
+                    );
+                }
+            }
+
+            if !state.undo_stack.is_empty() {
+                if ui
+                    .small_button("\u{f01e} Desfazer")
+                    .on_hover_text("Desfazer última troca de cena, preset ou colagem (Ctrl+Z)")
+                    .clicked()
+                {
+                    state.undo();
+                }
             }
 
             // Demo Simulation Toggle
@@ -287,6 +338,7 @@ fn render_top_bar(
                     Color32::from_rgb(231, 76, 60),
                     Vec2::new(66.0, 22.0),
                 )
+                .on_hover_text("Travar Console: Bloqueia a tela com senha (padrão: 1234) para evitar toques acidentais (Atalho: F12)")
                 .clicked()
                 {
                     state.console_locked = true;
@@ -295,22 +347,50 @@ fn render_top_bar(
 
                 ui.separator();
 
-                for vm in [ViewMode::Analog, ViewMode::Normal, ViewMode::BigDesktop] {
+                for vm in [ViewMode::Analog, ViewMode::Normal] {
                     let active = state.view_mode == vm && state.top_tab == TopNavTab::Mixer;
                     if draw_pill_button(
                         ui,
                         vm.label(),
                         active,
                         Color32::from_rgb(142, 68, 173),
-                        Vec2::new(98.0, 22.0),
+                        Vec2::new(102.0, 22.0),
                     )
-                    .on_hover_text("Alterna o modo visual da console (inspirado no DS Mixer)")
+                    .on_hover_text("Alterna o modo visual da console (Normal / Analógico)")
                     .clicked()
                     {
                         state.view_mode = vm;
                         state.top_tab = TopNavTab::Mixer;
                     }
                 }
+
+                ui.menu_button(
+                    RichText::new("\u{f0de} Presets Canal")
+                        .size(11.0)
+                        .strong()
+                        .color(Color32::from_rgb(0, 220, 255)),
+                    |ui| {
+                        let sel = state.selected_channel;
+                        ui.label(
+                            RichText::new(format!("Aplicar em: {}", state.channel_name(sel)))
+                                .strong()
+                                .size(11.5),
+                        );
+                        ui.label(
+                            RichText::new("Configura Ganho, HPF/LPF, Gate, Comp e EQ")
+                                .size(10.5),
+                        );
+                        ui.separator();
+                        for p in ChannelPreset::ALL {
+                            if ui.button(p.label()).clicked() {
+                                state.apply_channel_preset(sel, p);
+                                ui.close_menu();
+                            }
+                        }
+                    },
+                )
+                .response
+                .on_hover_text("Aplica presets prontos (Voz, Baixo, Guitarra, Violão, Teclado, Bateria) no canal selecionado");
             });
         });
 
@@ -431,7 +511,7 @@ fn render_bottom_bar(ui: &mut Ui, state: &mut Axios24State) {
             (FaderLayer::AllInputs, "TODOS 1-24"),
         ];
         let ly_w = if compact { 68.0 } else { 80.0 };
-        for (ly, lbl) in layers {
+        for (idx, (ly, lbl)) in layers.into_iter().enumerate() {
             let active = state.layer == ly;
             if draw_pill_button(
                 ui,
@@ -440,6 +520,7 @@ fn render_bottom_bar(ui: &mut Ui, state: &mut Axios24State) {
                 Color32::from_rgb(0, 168, 215),
                 Vec2::new(ly_w, 24.0),
             )
+            .on_hover_text(format!("Camada {} (Atalho: F{}): Exibe este grupo de faders na tela", lbl, idx + 1))
             .clicked()
             {
                 state.layer = ly;
@@ -580,6 +661,9 @@ fn handle_keyboard_shortcuts(ctx: &egui::Context, state: &mut Axios24State) {
             } else if i.key_pressed(egui::Key::D) {
                 state.toggle_master_dim();
                 return;
+            } else if i.key_pressed(egui::Key::Z) {
+                state.undo();
+                return;
             } else if i.modifiers.shift && i.key_pressed(egui::Key::S) {
                 state.clear_all_solos();
                 return;
@@ -680,8 +764,7 @@ fn handle_keyboard_shortcuts(ctx: &egui::Context, state: &mut Axios24State) {
         } else if i.key_pressed(egui::Key::F8) {
             state.view_mode = match state.view_mode {
                 ViewMode::Normal => ViewMode::Analog,
-                ViewMode::Analog => ViewMode::BigDesktop,
-                ViewMode::BigDesktop => ViewMode::Normal,
+                ViewMode::Analog => ViewMode::Normal,
             };
             state.toast(format!("Modo de Visão: {}", state.view_mode.label()));
         } else if i.key_pressed(egui::Key::F9) {
@@ -701,28 +784,10 @@ fn handle_keyboard_shortcuts(ctx: &egui::Context, state: &mut Axios24State) {
 // 1. MIXER WORKSPACE (Big Desktop Split View / Normal Console / Analog Console)
 // =============================================================================
 fn render_mixer_workspace(ui: &mut Ui, state: &mut Axios24State) {
-    let total_h = ui.available_height();
-    let max_w = ui.available_width();
-
-    if state.view_mode == ViewMode::BigDesktop && total_h >= 380.0 {
-        // DS Mixer "Big Desktop" Split View:
-        // Upper Half: Complete Selected Channel Inspector (Preamp + Interactive PEQ Graph + Gate/Comp Curves + Sends)
-        // Lower Half: Sends-on-Fader Toolbar + Full-Width Channel Fader Bank (while MAIN L & R sit in the right dock)
-        let top_h = (total_h * 0.42).clamp(180.0, 315.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(max_w, top_h),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                ui.set_clip_rect(ui.max_rect());
-                render_big_desktop_upper_inspector(ui, state, top_h);
-            },
-        );
-        ui.add_space(3.0);
-    } else {
-        // Quick Selected-Channel Rename & Color Bar in Normal / Analog mode
-        let sel = state.selected_channel;
-        let dark = state.dark_theme;
-        Frame::NONE
+    // Quick Selected-Channel Rename, Color, Link, DCA, Safe & Presets Bar
+    let sel = state.selected_channel;
+    let dark = state.dark_theme;
+    Frame::NONE
             .fill(if dark { Color32::from_rgb(16, 22, 32) } else { Color32::from_rgb(228, 234, 243) })
             .corner_radius(CornerRadius::same(5))
             .inner_margin(Margin::symmetric(8, 4))
@@ -777,6 +842,85 @@ fn render_mixer_workspace(ui: &mut Ui, state: &mut Axios24State) {
                         },
                     );
 
+                    let (sel_grp, sel_ch) = sel.group_and_index();
+                    if (sel_grp == 1 && sel_ch < 24) || (sel_grp == 3 && sel_ch < 10) {
+                        ui.separator();
+                        let pair_a = (sel_ch / 2) * 2;
+                        let is_st = if sel_grp == 1 {
+                            state.is_input_stereo_linked(sel_ch)
+                        } else {
+                            state.is_output_stereo_linked(sel_ch)
+                        };
+                        let pair_lbl = if sel_grp == 1 {
+                            format!("\u{f0c1} LINK CH{}+{}", pair_a + 1, pair_a + 2)
+                        } else if sel_ch >= 8 {
+                            "\u{f0c1} LINK L/R".to_string()
+                        } else {
+                            format!("\u{f0c1} LINK AUX{}+{}", pair_a + 1, pair_a + 2)
+                        };
+                        if draw_pill_button(
+                            ui,
+                            &pair_lbl,
+                            is_st,
+                            Color32::from_rgb(0, 188, 212),
+                            Vec2::new(102.0, 20.0),
+                        )
+                        .on_hover_text("Linca o par estéreo (fader, mute, EQ, ganho e dinâmica juntos, SEM mexer no Pan!)")
+                        .clicked()
+                        {
+                            if sel_grp == 1 {
+                                state.set_input_stereo_linked(sel_ch, !is_st);
+                            } else {
+                                state.set_output_stereo_linked(sel_ch, !is_st);
+                            }
+                        }
+
+                        if sel_grp == 1 && sel_ch < 24 {
+                            let cur_grp = state.input_custom_link_group(sel_ch);
+                            let grp_txt = if cur_grp == 0 {
+                                "Juntar Canais: Off".to_string()
+                            } else {
+                                format!("Juntar: Grupo {}", (b'A' + cur_grp - 1) as char)
+                            };
+                            egui::ComboBox::from_id_salt("custom_link_grp_combo")
+                                .selected_text(RichText::new(grp_txt).size(11.0))
+                                .width(126.0)
+                                .show_ui(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("Link Livre (ex: Teclado Estéreo)\nMuda tudo junto SEM mexer no Pan!")
+                                            .size(10.5),
+                                    );
+                                    ui.separator();
+                                    if ui.selectable_label(cur_grp == 0, "Sem Link Livre").clicked() {
+                                        state.set_input_custom_link_group(sel_ch, 0);
+                                    }
+                                    for g in 1..=4u8 {
+                                        let lbl = format!("Grupo {} (Link Livre)", (b'A' + g - 1) as char);
+                                        if ui.selectable_label(cur_grp == g, lbl).clicked() {
+                                            state.set_input_custom_link_group(sel_ch, g);
+                                        }
+                                    }
+                                });
+                        }
+                    }
+
+                    let flat_id_safe = sel.flat_id();
+                    if flat_id_safe < 42 {
+                        let is_safe = state.recall_safe_channels[flat_id_safe];
+                        if draw_pill_button(
+                            ui,
+                            if is_safe { "\u{f023} SAFE" } else { "SAFE" },
+                            is_safe,
+                            Color32::from_rgb(230, 126, 34),
+                            Vec2::new(52.0, 20.0),
+                        )
+                        .on_hover_text("Recall Safe: Protege este canal para não mudar ao carregar outra cena")
+                        .clicked()
+                        {
+                            state.recall_safe_channels[flat_id_safe] = !is_safe;
+                        }
+                    }
+
                     if let (1, ch) = sel.group_and_index() {
                         if let SendsOnFaderTarget::Aux(aux_idx) = state.sends_on_fader {
                             ui.separator();
@@ -804,15 +948,54 @@ fn render_mixer_workspace(ui: &mut Ui, state: &mut Axios24State) {
                         }
                     }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("\u{f085} Editar Canal Completo").clicked() {
-                            state.top_tab = TopNavTab::EditChannel;
+                    if sel_grp != 4 {
+                        let flat_id = sel.flat_id();
+                        if flat_id < 38 {
+                            ui.separator();
+                            ui.label(RichText::new("DCA:").size(10.5).strong());
+                            for dca in 0..4 {
+                                let mem = state.is_in_dca_group(dca, flat_id);
+                                if draw_pill_button(
+                                    ui,
+                                    &format!("D{}", dca + 1),
+                                    mem,
+                                    Color32::from_rgb(241, 196, 15),
+                                    Vec2::new(26.0, 20.0),
+                                )
+                                .on_hover_text(format!("Adicionar/Remover este canal do DCA {}", dca + 1))
+                                .clicked()
+                                {
+                                    state.set_in_dca_group(dca, flat_id, !mem);
+                                }
+                            }
                         }
-                    });
+                    } else {
+                        ui.separator();
+                        if draw_pill_button(
+                            ui,
+                            "\u{f085} Configurar Canais do DCA",
+                            true,
+                            Color32::from_rgb(241, 196, 15),
+                            Vec2::new(165.0, 20.0),
+                        )
+                        .clicked()
+                        {
+                            state.top_tab = TopNavTab::Settings;
+                            state.settings_tab = SettingsSubTab::DcaGroup;
+                        }
+                    }
+
+                    ui.separator();
+                    if ui
+                        .small_button("\u{f085} Editar Canal Completo")
+                        .on_hover_text("Abre a tela completa de edição deste canal (Preamp, Gate, Compressor, AUX e DCA)")
+                        .clicked()
+                    {
+                        state.top_tab = TopNavTab::EditChannel;
+                    }
                 });
             });
-        ui.add_space(3.0);
-    }
+    ui.add_space(3.0);
 
     // Sends on Fader (SOF) + Search (Ctrl+F) + Diagnostic Bar (Fixes #1 Duonn Forum Complaints)
     let dark = state.dark_theme;
@@ -1008,32 +1191,33 @@ fn render_mixer_workspace(ui: &mut Ui, state: &mut Axios24State) {
         channels.push(state.selected_channel);
     }
 
-    let n = channels.len().max(1);
     let spacing = 4.0_f32;
-    let total_spacing = spacing * (n.saturating_sub(1) as f32);
-    let expanded_strip_w = (avail_w - total_spacing) / (n as f32);
-
-    if expanded_strip_w >= 45.0 {
-        // Fit all channels in the layer across 100% of the window width with zero scrollbar
+    if channels.len() > 12 {
+        // Reorganize 24 channels into 2 clean rows: 12 on top + 12 on bottom (100% visible, zero overflow)
+        let row_gap = 4.0_f32;
+        let row_h = ((strips_h - row_gap) * 0.5).max(120.0);
+        let strip_w = ((avail_w - spacing * 11.0) / 12.0).max(44.0);
+        for (row_idx, row_channels) in channels.chunks(12).enumerate() {
+            if row_idx > 0 {
+                ui.add_space(row_gap);
+            }
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = spacing;
+                for &sel in row_channels {
+                    draw_channel_strip(ui, state, sel, strip_w, row_h, false);
+                }
+            });
+        }
+    } else {
+        let n = channels.len().max(1);
+        let total_spacing = spacing * (n.saturating_sub(1) as f32);
+        let expanded_strip_w = ((avail_w - total_spacing) / (n as f32)).max(44.0);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = spacing;
             for sel in channels {
                 draw_channel_strip(ui, state, sel, expanded_strip_w, strips_h, false);
             }
         });
-    } else {
-        // Fallback horizontal scroll only when viewing 24 channels on a narrow window
-        let scroll_strip_h = (strips_h - 12.0).max(120.0);
-        ScrollArea::horizontal()
-            .id_salt("fader_bank_scroll")
-            .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = spacing;
-                    for sel in channels {
-                        draw_channel_strip(ui, state, sel, 52.0, scroll_strip_h, false);
-                    }
-                });
-            });
     }
 }
 
@@ -1066,554 +1250,6 @@ fn channels_for_layer(layer: FaderLayer) -> Vec<SelectedChannel> {
     }
 }
 
-/// Renders the upper inspector rack in "Big Desktop" mode (Preamp, Interactive PEQ Graph, Gate & Comp Curve Graphs, Aux Sends)
-fn render_big_desktop_upper_inspector(ui: &mut Ui, state: &mut Axios24State, height: f32) {
-    let sel = state.selected_channel;
-    let (group, ch) = sel.group_and_index();
-    let flat_id = sel.flat_id();
-    let meter_db = state.channel_meters_db[flat_id];
-    let gap = 6.0_f32;
-    let usable_w = (ui.available_width() - gap * 3.0).max(400.0);
-
-    let pre_w = usable_w * 0.21;
-    let eq_w = usable_w * 0.41;
-    let dyn_w = usable_w * 0.21;
-    let send_w = usable_w * 0.17;
-
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-
-        // 1. Preamp & Channel Card (21% width)
-        Frame::NONE
-            .fill(Color32::from_rgb(16, 21, 31))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(Margin::same(6))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 49, 68)))
-            .show(ui, |ui| {
-                let inner_w = (pre_w - 12.0).max(110.0);
-                let inner_h = (height - 12.0).max(120.0);
-                ui.set_width(inner_w);
-                ui.set_max_width(inner_w);
-                ui.set_height(inner_h);
-                ui.set_max_height(inner_h);
-
-                let knob_d = if inner_h < 220.0 || inner_w < 175.0 {
-                    32.0
-                } else {
-                    38.0
-                };
-
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("CANAL / PREAMP")
-                                .size(11.0)
-                                .strong()
-                                .color(Color32::from_rgb(0, 215, 255)),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Editar").clicked() {
-                                state.top_tab = TopNavTab::EditChannel;
-                            }
-                        });
-                    });
-
-                    // Channel Name & Color Dots
-                    let mut name = state.channel_name(sel).to_string();
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Nome:").size(10.5));
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut name)
-                                    .desired_width((inner_w - 46.0).max(55.0)),
-                            )
-                            .changed()
-                        {
-                            state.set_channel_name(sel, name);
-                        }
-                    });
-                    let dot_w = ((inner_w - 7.0 * 3.0) / 8.0).clamp(11.0, 15.0);
-                    draw_color_palette_grid(ui, state, sel, 8, dot_w);
-
-                    if group == 1 {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            let mut gain = state.input_preamp_gain_db(ch);
-                            let g_txt = format!("+{:.0}dB", gain);
-                            if draw_rotary_knob(
-                                ui,
-                                "GANHO",
-                                &mut gain,
-                                0.0,
-                                60.0,
-                                0.0,
-                                &g_txt,
-                                Color32::from_rgb(231, 76, 60),
-                                knob_d,
-                            ) {
-                                state.set_input_preamp_gain_db(ch, gain);
-                            }
-
-                            let mut dly = state.input_delay_ms(ch);
-                            let d_txt = format!("{:.1}ms", dly);
-                            if draw_rotary_knob(
-                                ui,
-                                "DELAY",
-                                &mut dly,
-                                0.0,
-                                10.0,
-                                0.0,
-                                &d_txt,
-                                Color32::from_rgb(52, 152, 219),
-                                knob_d,
-                            ) {
-                                state.set_input_delay_ms(ch, dly);
-                            }
-
-                            let mut pan = state.input_pan(ch) as f32;
-                            let p_txt = if pan.abs() < 1.0 {
-                                "L=R".to_string()
-                            } else if pan < 0.0 {
-                                format!("L{:.0}", -pan)
-                            } else {
-                                format!("R{:.0}", pan)
-                            };
-                            if draw_rotary_knob(
-                                ui,
-                                "PAN",
-                                &mut pan,
-                                -100.0,
-                                100.0,
-                                0.0,
-                                &p_txt,
-                                Color32::from_rgb(46, 204, 113),
-                                knob_d,
-                            ) {
-                                state.set_input_pan(ch, pan.round() as i32);
-                            }
-                        });
-
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
-                            if ch < 24 {
-                                let p48 = state.input_phantom_48v(ch);
-                                if draw_pill_button(
-                                    ui,
-                                    "+48V",
-                                    p48,
-                                    Color32::from_rgb(231, 76, 60),
-                                    Vec2::new(42.0, 19.0),
-                                )
-                                .clicked()
-                                {
-                                    state.set_input_phantom_48v(ch, !p48);
-                                }
-                            }
-                            let inv = state.input_phase_invert(ch);
-                            if draw_pill_button(
-                                ui,
-                                "Ø FASE",
-                                inv,
-                                Color32::from_rgb(243, 156, 18),
-                                Vec2::new(48.0, 19.0),
-                            )
-                            .clicked()
-                            {
-                                state.set_input_phase_invert(ch, !inv);
-                            }
-                            if ch < 2 {
-                                let hiz = state.input_hiz(ch);
-                                if draw_pill_button(
-                                    ui,
-                                    "HI-Z",
-                                    hiz,
-                                    Color32::from_rgb(155, 89, 182),
-                                    Vec2::new(40.0, 19.0),
-                                )
-                                .clicked()
-                                {
-                                    state.set_input_hiz(ch, !hiz);
-                                }
-                            }
-                            if ch < 24 {
-                                let lnk = state.is_input_stereo_linked(ch);
-                                if draw_pill_button(
-                                    ui,
-                                    "LINK",
-                                    lnk,
-                                    Color32::from_rgb(0, 188, 212),
-                                    Vec2::new(44.0, 19.0),
-                                )
-                                .clicked()
-                                {
-                                    state.set_input_stereo_linked(ch, !lnk);
-                                }
-                            }
-                        });
-                    } else if group == 3 {
-                        let mut dly = state.output_delay_ms(ch);
-                        let d_txt = format!("{:.1} ms", dly);
-                        if draw_rotary_knob(
-                            ui,
-                            "DELAY SAÍDA",
-                            &mut dly,
-                            0.0,
-                            40.0,
-                            0.0,
-                            &d_txt,
-                            Color32::from_rgb(52, 152, 219),
-                            knob_d,
-                        ) {
-                            state.set_output_delay_ms(ch, dly);
-                        }
-                        ui.horizontal(|ui| {
-                            let inv = state.output_phase_invert(ch);
-                            if draw_pill_button(
-                                ui,
-                                "Ø FASE",
-                                inv,
-                                Color32::from_rgb(243, 156, 18),
-                                Vec2::new(56.0, 20.0),
-                            )
-                            .clicked()
-                            {
-                                state.set_output_phase_invert(ch, !inv);
-                            }
-                            let lnk = state.is_output_stereo_linked(ch);
-                            if draw_pill_button(
-                                ui,
-                                "LINK PAR",
-                                lnk,
-                                Color32::from_rgb(0, 188, 212),
-                                Vec2::new(62.0, 20.0),
-                            )
-                            .clicked()
-                            {
-                                state.set_output_stereo_linked(ch, !lnk);
-                            }
-                        });
-                    }
-
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 3.0;
-                        if group == 1 && ch < 24 {
-                            if ui
-                                .small_button("\u{f0e7} Auto-Gain")
-                                .on_hover_text("Ajusta o ganho do pré-amplificador automaticamente para o nível nominal (-18 dB)")
-                                .clicked()
-                            {
-                                state.run_auto_gain(ch);
-                            }
-                        }
-                        egui::ComboBox::from_id_salt("big_desk_preset_combo")
-                            .selected_text("Presets")
-                            .width(68.0)
-                            .show_ui(ui, |ui| {
-                                for p in ChannelPreset::ALL {
-                                    if ui.selectable_label(false, p.label()).clicked() {
-                                        state.apply_channel_preset(sel, p);
-                                    }
-                                }
-                            });
-                        if ui.small_button("\u{f0c5}").on_hover_text("Copiar Canal").clicked() {
-                            state.clipboard_channel = Some(sel);
-                            state.toast(format!("Canal {} copiado!", state.channel_name(sel)));
-                        }
-                        if let Some(src) = state.clipboard_channel {
-                            if ui.small_button("\u{f0ea}").on_hover_text("Colar Canal").clicked() {
-                                state.paste_channel_from(src, sel);
-                            }
-                        }
-                    });
-                });
-            });
-
-        // 2. Interactive Parametric Equalizer Graph (41% width)
-        Frame::NONE
-            .fill(Color32::from_rgb(16, 21, 31))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(Margin::same(6))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 49, 68)))
-            .show(ui, |ui| {
-                let inner_w = (eq_w - 12.0).max(200.0);
-                let inner_h = (height - 12.0).max(120.0);
-                ui.set_width(inner_w);
-                ui.set_max_width(inner_w);
-                ui.set_height(inner_h);
-                ui.set_max_height(inner_h);
-                let eq_group = group.max(1).min(3);
-                let eq_ch = if group == 4 { 0 } else { ch };
-
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("EQUALIZADOR (PEQ)")
-                            .size(11.0)
-                            .strong()
-                            .color(Color32::from_rgb(0, 230, 255)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 3.0;
-                        if ui.small_button("GEQ / Full").clicked() {
-                            state.top_tab = TopNavTab::PeqGeq;
-                        }
-                        if ui
-                            .small_button("\u{f071} Notch")
-                            .on_hover_text("Anti-Microfonia: aplica um filtro Notch estreito (Q=18, -9dB) no pico de frequência atual")
-                            .clicked()
-                        {
-                            state.apply_anti_feedback_notch(eq_group, eq_ch);
-                        }
-                        if ui.small_button("Reset").clicked() {
-                            state.reset_peq(eq_group, eq_ch);
-                        }
-                        let rta = state.show_rta_on_eq;
-                        if draw_pill_button(
-                            ui,
-                            "RTA",
-                            rta,
-                            Color32::from_rgb(0, 180, 215),
-                            Vec2::new(34.0, 18.0),
-                        )
-                        .clicked()
-                        {
-                            state.show_rta_on_eq = !rta;
-                        }
-                        let eq_on = state.eq_enabled(eq_group, eq_ch);
-                        if draw_pill_button(
-                            ui,
-                            if eq_on { "EQ ON" } else { "BYP" },
-                            eq_on,
-                            Color32::from_rgb(46, 204, 113),
-                            Vec2::new(44.0, 18.0),
-                        )
-                        .clicked()
-                        {
-                            state.set_eq_enabled(eq_group, eq_ch, !eq_on);
-                        }
-                    });
-                });
-
-                let graph_h = (ui.available_height() - 24.0).max(90.0);
-                draw_interactive_peq_graph(
-                    ui,
-                    state,
-                    eq_group,
-                    eq_ch,
-                    Vec2::new(ui.available_width(), graph_h),
-                );
-
-                // Quick band selector bar under the EQ curve
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let nb = Axios24State::peq_band_count(eq_group);
-                    if draw_pill_button(
-                        ui,
-                        "HPF",
-                        state.selected_eq_band == 0,
-                        EQ_BAND_COLORS[0],
-                        Vec2::new(34.0, 18.0),
-                    )
-                    .clicked()
-                    {
-                        state.selected_eq_band = 0;
-                    }
-                    for b in 1..=nb {
-                        if draw_pill_button(
-                            ui,
-                            &format!("B{}", b),
-                            state.selected_eq_band == b,
-                            EQ_BAND_COLORS[b.min(7)],
-                            Vec2::new(28.0, 18.0),
-                        )
-                        .clicked()
-                        {
-                            state.selected_eq_band = b;
-                        }
-                    }
-                    if draw_pill_button(
-                        ui,
-                        "LPF",
-                        state.selected_eq_band == nb + 1,
-                        EQ_BAND_COLORS[8],
-                        Vec2::new(34.0, 18.0),
-                    )
-                    .clicked()
-                    {
-                        state.selected_eq_band = nb + 1;
-                    }
-                });
-            });
-
-        // 3. Dynamics Card: Noise Gate & Compressor Transfer Curve Graphs (21% width)
-        Frame::NONE
-            .fill(Color32::from_rgb(16, 21, 31))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(Margin::same(6))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 49, 68)))
-            .show(ui, |ui| {
-                let inner_w = (dyn_w - 12.0).max(140.0);
-                let inner_h = (height - 12.0).max(120.0);
-                ui.set_width(inner_w);
-                ui.set_max_width(inner_w);
-                ui.set_height(inner_h);
-                ui.set_max_height(inner_h);
-                ui.label(
-                    RichText::new("DINÂMICA (GATE & COMP)")
-                        .size(11.0)
-                        .strong()
-                        .color(Color32::from_rgb(255, 195, 0)),
-                );
-
-                let c_grp = if group == 3 { 3 } else { 1 };
-                let c_ch = if group == 3 { ch } else { ch.min(25) };
-
-                ui.horizontal(|ui| {
-                    let sub_w = ((ui.available_width() - 6.0) * 0.5).max(60.0);
-                    let curve_h = (ui.available_height() - 26.0).max(80.0);
-
-                    // Gate Curve
-                    ui.vertical(|ui| {
-                        let g_on = state.input_gate_enabled(c_ch);
-                        let mut g_th = state.input_gate_threshold_db(c_ch);
-                        if draw_gate_curve_graph(
-                            ui,
-                            &mut g_th,
-                            g_on,
-                            meter_db,
-                            Vec2::new(sub_w, curve_h),
-                        ) {
-                            state.set_input_gate_threshold_db(c_ch, g_th);
-                        }
-                        if draw_pill_button(
-                            ui,
-                            if g_on { "GATE ON" } else { "GATE OFF" },
-                            g_on,
-                            Color32::from_rgb(46, 204, 113),
-                            Vec2::new(sub_w, 18.0),
-                        )
-                        .clicked()
-                        {
-                            state.set_input_gate_enabled(c_ch, !g_on);
-                        }
-                    });
-
-                    // Compressor Curve
-                    ui.vertical(|ui| {
-                        let c_on = state.comp_enabled(c_grp, c_ch);
-                        let mut c_th = state.comp_threshold_db(c_grp, c_ch);
-                        let c_rat = state.comp_ratio(c_grp, c_ch);
-                        let c_gn = state.comp_gain_db(c_grp, c_ch);
-                        if draw_comp_curve_graph(
-                            ui,
-                            &mut c_th,
-                            c_rat,
-                            c_gn,
-                            c_on,
-                            meter_db,
-                            Vec2::new(sub_w, curve_h),
-                        ) {
-                            state.set_comp_threshold_db(c_grp, c_ch, c_th);
-                        }
-                        if draw_pill_button(
-                            ui,
-                            if c_on { "COMP ON" } else { "COMP OFF" },
-                            c_on,
-                            Color32::from_rgb(243, 156, 18),
-                            Vec2::new(sub_w, 18.0),
-                        )
-                        .clicked()
-                        {
-                            state.set_comp_enabled(c_grp, c_ch, !c_on);
-                        }
-                    });
-                });
-            });
-
-        // 4. Bus Sends Card: AUX 1-8 & FX 1-2 (17% width)
-        Frame::NONE
-            .fill(Color32::from_rgb(16, 21, 31))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(Margin::same(6))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 49, 68)))
-            .show(ui, |ui| {
-                let inner_w = (send_w - 12.0).max(110.0);
-                let inner_h = (height - 12.0).max(120.0);
-                ui.set_width(inner_w);
-                ui.set_max_width(inner_w);
-                ui.set_height(inner_h);
-                ui.set_max_height(inner_h);
-                ui.label(
-                    RichText::new("AUX 1-8 & FX 1-2")
-                        .size(11.0)
-                        .strong()
-                        .color(Color32::from_rgb(46, 213, 115)),
-                );
-
-                let in_ch = if group == 1 { ch } else { 0 };
-                ScrollArea::vertical()
-                    .id_salt("big_desktop_sends")
-                    .show(ui, |ui| {
-                        let sl_w = (inner_w - 72.0).max(36.0);
-                        ui.spacing_mut().slider_width = sl_w;
-                        for aux in 0..8 {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 3.0;
-                                let mut s_db = state.input_aux_send_db(in_ch, aux);
-                                let pre = state.input_aux_pre_fader(in_ch, aux);
-                                if draw_pill_button(
-                                    ui,
-                                    if pre { "PRE" } else { "PST" },
-                                    pre,
-                                    Color32::from_rgb(26, 188, 156),
-                                    Vec2::new(28.0, 16.0),
-                                )
-                                .clicked()
-                                {
-                                    state.set_input_aux_pre_fader(in_ch, aux, !pre);
-                                }
-                                ui.label(
-                                    RichText::new(format!("A{}", aux + 1))
-                                        .size(10.0)
-                                        .monospace(),
-                                );
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut s_db, -120.0..=0.0)
-                                            .show_value(false),
-                                    )
-                                    .changed()
-                                {
-                                    state.set_input_aux_send_db(in_ch, aux, s_db);
-                                }
-                            });
-                        }
-                        for fx in 0..2 {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 3.0;
-                                let mut f_db = state.input_fx_send_db(in_ch, fx);
-                                ui.label(
-                                    RichText::new(format!("FX{}", fx + 1))
-                                        .size(10.0)
-                                        .monospace()
-                                        .color(Color32::from_rgb(233, 30, 99)),
-                                );
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut f_db, -120.0..=0.0)
-                                            .show_value(false),
-                                    )
-                                    .changed()
-                                {
-                                    state.set_input_fx_send_db(in_ch, fx, f_db);
-                                }
-                            });
-                        }
-                    });
-            });
-    });
-}
-
 // =============================================================================
 // 2. DEDICATED CHANNEL EDIT PAGE (Preamp, Recording, Gate, Comp, Sends, DCA/Mute)
 // =============================================================================
@@ -1629,25 +1265,28 @@ fn render_edit_channel_page(ui: &mut Ui, state: &mut Axios24State) {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
                 for i in 0..24 {
                     let s = SelectedChannel::Input(i);
+                    let lbl = state.channel_name(s).to_string();
                     if draw_pill_button(
                         ui,
-                        &format!("IN{}", i + 1),
+                        &lbl,
                         state.selected_channel == s,
                         Color32::from_rgb(0, 180, 215),
-                        Vec2::new(40.0, 22.0),
+                        Vec2::new(62.0, 22.0),
                     )
+                    .on_hover_text(format!("CH {:02} — {}", i + 1, lbl))
                     .clicked()
                     {
                         state.selected_channel = s;
                     }
                 }
                 let s_digi = SelectedChannel::Input(24);
+                let digi_lbl = state.channel_name(s_digi).to_string();
                 if draw_pill_button(
                     ui,
-                    "DIGI",
+                    &digi_lbl,
                     state.selected_channel == s_digi,
                     Color32::from_rgb(155, 89, 182),
-                    Vec2::new(46.0, 22.0),
+                    Vec2::new(62.0, 22.0),
                 )
                 .clicked()
                 {
@@ -1655,27 +1294,47 @@ fn render_edit_channel_page(ui: &mut Ui, state: &mut Axios24State) {
                 }
                 for i in 0..8 {
                     let s = SelectedChannel::Output(i);
+                    let aux_lbl = state.channel_name(s).to_string();
                     if draw_pill_button(
                         ui,
-                        &format!("AUX{}", i + 1),
+                        &aux_lbl,
                         state.selected_channel == s,
                         Color32::from_rgb(26, 188, 156),
-                        Vec2::new(46.0, 22.0),
+                        Vec2::new(60.0, 22.0),
                     )
+                    .on_hover_text(format!("AUX {} — {}", i + 1, aux_lbl))
                     .clicked()
                     {
                         state.selected_channel = s;
                     }
                 }
-                for (i, lbl) in [(8, "MAIN L"), (9, "MAIN R")] {
+                for (i, def_lbl) in [(8, "MAIN L"), (9, "MAIN R")] {
                     let s = SelectedChannel::Output(i);
+                    let m_lbl = state.channel_name(s).to_string();
                     if draw_pill_button(
                         ui,
-                        lbl,
+                        &m_lbl,
                         state.selected_channel == s,
                         Color32::from_rgb(0, 215, 255),
-                        Vec2::new(56.0, 22.0),
+                        Vec2::new(62.0, 22.0),
                     )
+                    .on_hover_text(def_lbl)
+                    .clicked()
+                    {
+                        state.selected_channel = s;
+                    }
+                }
+                for dca in 0..4 {
+                    let s = SelectedChannel::Dca(dca);
+                    let d_lbl = state.channel_name(s).to_string();
+                    if draw_pill_button(
+                        ui,
+                        &d_lbl,
+                        state.selected_channel == s,
+                        Color32::from_rgb(241, 196, 15),
+                        Vec2::new(64.0, 22.0),
+                    )
+                    .on_hover_text(format!("DCA {} — {}", dca + 1, d_lbl))
                     .clicked()
                     {
                         state.selected_channel = s;
@@ -1686,6 +1345,10 @@ fn render_edit_channel_page(ui: &mut Ui, state: &mut Axios24State) {
 
     ui.add_space(6.0);
     let sel = state.selected_channel;
+    if let SelectedChannel::Dca(dca_idx) = sel {
+        render_single_dca_editor(ui, state, dca_idx);
+        return;
+    }
     let (group, ch) = sel.group_and_index();
     let flat_id = sel.flat_id();
     let meter_db = state.channel_meters_db[flat_id];
@@ -1698,13 +1361,117 @@ fn render_edit_channel_page(ui: &mut Ui, state: &mut Axios24State) {
             .inner_margin(Margin::same(10))
             .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 49, 68)))
             .show(&mut cols[0], |ui| {
+                ScrollArea::vertical().id_salt("edit_col0_scroll").show(ui, |ui| {
                 ui.heading(
-                    RichText::new(format!("1. PREAMP & NOISE GATE — {}", state.channel_name(sel)))
+                    RichText::new(format!("1. PREAMP & GANHO — {}", state.channel_name(sel)))
                         .size(14.0)
                         .color(Color32::from_rgb(0, 220, 255)),
                 );
                 ui.separator();
 
+                if group == 1 {
+                    Frame::NONE
+                        .fill(Color32::from_rgb(12, 17, 25))
+                        .corner_radius(CornerRadius::same(5))
+                        .inner_margin(Margin::same(8))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(52, 68, 92)))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let mut gain = state.input_preamp_gain_db(ch);
+                                let g_txt = format!("+{:.0} dB", gain);
+                                if draw_rotary_knob(
+                                    ui,
+                                    "GANHO",
+                                    &mut gain,
+                                    0.0,
+                                    60.0,
+                                    0.0,
+                                    &g_txt,
+                                    Color32::from_rgb(231, 76, 60),
+                                    44.0,
+                                ) {
+                                    state.set_input_preamp_gain_db(ch, gain);
+                                }
+                                let mut dly = state.input_delay_ms(ch);
+                                let d_txt = format!("{:.1} ms", dly);
+                                if draw_rotary_knob(
+                                    ui,
+                                    "DELAY",
+                                    &mut dly,
+                                    0.0,
+                                    40.0,
+                                    0.0,
+                                    &d_txt,
+                                    Color32::from_rgb(52, 152, 219),
+                                    44.0,
+                                ) {
+                                    state.set_input_delay_ms(ch, dly);
+                                }
+                                let mut pan = state.input_pan(ch) as f32;
+                                let p_txt = if pan.abs() < 1.0 {
+                                    "L=R".to_string()
+                                } else if pan < 0.0 {
+                                    format!("L{:.0}", -pan)
+                                } else {
+                                    format!("R{:.0}", pan)
+                                };
+                                if draw_rotary_knob(
+                                    ui,
+                                    "PAN",
+                                    &mut pan,
+                                    -100.0,
+                                    100.0,
+                                    0.0,
+                                    &p_txt,
+                                    Color32::from_rgb(46, 204, 113),
+                                    44.0,
+                                ) {
+                                    state.set_input_pan(ch, pan.round() as i32);
+                                }
+                            });
+
+                            if ch < 24 {
+                                let mut gain = state.input_preamp_gain_db(ch);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Ganho:").size(11.5).strong());
+                                    if ui
+                                        .add(egui::Slider::new(&mut gain, 0.0..=60.0).text("dB"))
+                                        .changed()
+                                    {
+                                        state.set_input_preamp_gain_db(ch, gain);
+                                    }
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    let p48 = state.input_phantom_48v(ch);
+                                    if draw_pill_button(ui, "+48V", p48, Color32::from_rgb(231, 76, 60), Vec2::new(48.0, 20.0)).clicked() {
+                                        state.set_input_phantom_48v(ch, !p48);
+                                    }
+                                    let inv = state.input_phase_invert(ch);
+                                    if draw_pill_button(ui, "Ø FASE", inv, Color32::from_rgb(243, 156, 18), Vec2::new(58.0, 20.0)).clicked() {
+                                        state.set_input_phase_invert(ch, !inv);
+                                    }
+                                    if ch >= 20 {
+                                        let hiz = state.input_hiz(ch);
+                                        if draw_pill_button(ui, "HI-Z", hiz, Color32::from_rgb(155, 89, 182), Vec2::new(44.0, 20.0)).clicked() {
+                                            state.set_input_hiz(ch, !hiz);
+                                        }
+                                    }
+                                    if ui.small_button("\u{f0e7} Auto-Gain").clicked() {
+                                        state.run_auto_gain(ch);
+                                    }
+                                });
+                            }
+                        });
+                    ui.add_space(6.0);
+                }
+
+                ui.label(
+                    RichText::new("NOISE GATE")
+                        .size(12.5)
+                        .strong()
+                        .color(Color32::from_rgb(46, 204, 113)),
+                );
                 let c_ch = if group == 1 { ch } else { 0 };
                 let mut g_on = state.input_gate_enabled(c_ch);
                 let mut g_th = state.input_gate_threshold_db(c_ch);
@@ -1713,7 +1480,7 @@ fn render_edit_channel_page(ui: &mut Ui, state: &mut Axios24State) {
                     &mut g_th,
                     g_on,
                     meter_db,
-                    Vec2::new(ui.available_width(), 170.0),
+                    Vec2::new(ui.available_width(), 125.0),
                 ) {
                     state.set_input_gate_threshold_db(c_ch, g_th);
                 }
@@ -1828,6 +1595,7 @@ fn render_edit_channel_page(ui: &mut Ui, state: &mut Axios24State) {
                         }
                     }
                 });
+                });
             });
 
         // Column 1: Compressor
@@ -1838,10 +1606,22 @@ fn render_edit_channel_page(ui: &mut Ui, state: &mut Axios24State) {
             .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 49, 68)))
             .show(&mut cols[1], |ui| {
                 ui.heading(
-                    RichText::new("2. COMPRESSOR DINÂMICO")
-                        .size(14.0)
-                        .color(Color32::from_rgb(255, 185, 0)),
+                    RichText::new(format!(
+                        "2. COMPRESSOR DINÂMICO (GR: -{:.1} dB)",
+                        state.comp_gr_db[flat_id]
+                    ))
+                    .size(14.0)
+                    .color(Color32::from_rgb(255, 185, 0)),
                 );
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(RichText::new("Presets Dinâmica:").size(11.0));
+                    for (p_idx, p_lbl) in ["Voz Suave", "Bumbo Seco", "Locução", "Bypass"].iter().enumerate() {
+                        if ui.small_button(*p_lbl).clicked() {
+                            state.apply_dynamics_preset(sel, p_idx);
+                        }
+                    }
+                });
                 ui.separator();
 
                 let c_grp = if group == 3 { 3 } else { 1 };
@@ -2054,7 +1834,8 @@ fn render_peq_geq_page(ui: &mut Ui, state: &mut Axios24State) {
     let eq_ch = if group == 4 { 0 } else { ch };
 
     // Top Channel Selector + Mode Toolbar
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
         ui.label(
             RichText::new(format!(
                 "EQUALIZADOR GRÁFICO & PARAMÉTRICO — Canal: {}",
@@ -2064,6 +1845,22 @@ fn render_peq_geq_page(ui: &mut Ui, state: &mut Axios24State) {
             .strong()
             .color(Color32::from_rgb(0, 230, 255)),
         );
+
+        if eq_group == 3 && eq_ch >= 8 {
+            let lr_lnk = state.is_output_stereo_linked(8);
+            if draw_pill_button(
+                ui,
+                if lr_lnk { "\u{f0c1} LINK L&R ON" } else { "\u{f0c1} LINK L&R OFF" },
+                lr_lnk,
+                Color32::from_rgb(0, 188, 212),
+                Vec2::new(112.0, 24.0),
+            )
+            .on_hover_text("Sincroniza o EQ e GEQ entre MAIN L e MAIN R")
+            .clicked()
+            {
+                state.set_output_stereo_linked(8, !lr_lnk);
+            }
+        }
 
         ui.separator();
         let eq_on = state.eq_enabled(eq_group, eq_ch);
@@ -2090,6 +1887,19 @@ fn render_peq_geq_page(ui: &mut Ui, state: &mut Axios24State) {
         .clicked()
         {
             state.show_rta_on_eq = !rta;
+        }
+
+        if draw_pill_button(
+            ui,
+            "\u{f0e7} AFS2 Anti-Microfonia",
+            false,
+            Color32::from_rgb(231, 76, 60),
+            Vec2::new(155.0, 24.0),
+        )
+        .on_hover_text("Soundcraft AFS2: Identifica o pico no RTA e aplica corte Notch estreito (-9 dB, Q=18)")
+        .clicked()
+        {
+            state.run_afs2_feedback_hunt();
         }
 
         let fills = state.show_band_fills;
@@ -2205,9 +2015,10 @@ fn render_peq_geq_page(ui: &mut Ui, state: &mut Axios24State) {
 
     ui.add_space(4.0);
 
+    ScrollArea::vertical().id_salt("peq_geq_page_scroll").show(ui, |ui| {
     // Main Interactive Parametric EQ Graph
     let peq_graph_h = if eq_group == 3 {
-        (ui.available_height() * 0.42).clamp(180.0, 280.0)
+        (ui.available_height() * 0.42).clamp(180.0, 260.0)
     } else {
         (ui.available_height() * 0.62).clamp(240.0, 420.0)
     };
@@ -2276,10 +2087,10 @@ fn render_peq_geq_page(ui: &mut Ui, state: &mut Axios24State) {
                     )
                     .clicked()
                     {
-                        state.output_geq_enabled[out_idx] = !geq_on;
+                        state.set_output_geq_enabled(out_idx, !geq_on);
                     }
                     if ui.button("Resetar GEQ 0dB").clicked() {
-                        state.output_geq_db[out_idx] = [0.0; 31];
+                        state.reset_output_geq(out_idx);
                     }
                 });
 
@@ -2313,9 +2124,9 @@ fn render_peq_geq_page(ui: &mut Ui, state: &mut Axios24State) {
                                         .show_value(false);
                                     let resp = ui.add_sized([22.0, 82.0], sl);
                                     if resp.double_clicked() {
-                                        state.output_geq_db[out_idx][b] = 0.0;
+                                        state.set_output_geq_db(out_idx, b, 0.0);
                                     } else if resp.changed() {
-                                        state.output_geq_db[out_idx][b] = (g * 10.0).round() / 10.0;
+                                        state.set_output_geq_db(out_idx, b, g);
                                     }
                                     ui.label(
                                         RichText::new(GEQ_LABELS[b])
@@ -2328,6 +2139,7 @@ fn render_peq_geq_page(ui: &mut Ui, state: &mut Axios24State) {
                     });
             });
     }
+    });
 }
 
 fn render_hpf_lpf_card(
@@ -2576,6 +2388,38 @@ fn render_effects_page(ui: &mut Ui, state: &mut Axios24State) {
                     });
                     ui.separator();
 
+                    // Soundcraft Ui24R Tap Tempo Bar
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if draw_pill_button(
+                            ui,
+                            &format!("\u{f001} TAP TEMPO ({:.1} BPM)", state.tap_tempo_bpm),
+                            true,
+                            Color32::from_rgb(0, 188, 212),
+                            Vec2::new(165.0, 24.0),
+                        )
+                        .on_hover_text("Clique no ritmo da música para ajustar o tempo do Delay/FX")
+                        .clicked()
+                        {
+                            state.tap_tempo_hit(fx_idx);
+                        }
+                        for (sub_i, sub_lbl) in ["1/4", "1/8", "1/8.", "1/16"].iter().enumerate() {
+                            if draw_pill_button(
+                                ui,
+                                sub_lbl,
+                                state.tap_subdivision == sub_i,
+                                Color32::from_rgb(243, 156, 18),
+                                Vec2::new(44.0, 24.0),
+                            )
+                            .clicked()
+                            {
+                                state.tap_subdivision = sub_i;
+                                state.apply_tap_tempo_to_fx(fx_idx);
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+
                     // Algorithm Selector Grid (16 slots per FX unit)
                     let base_id = if fx_idx == 0 { 1u16 } else { 17u16 };
                     egui::Grid::new(format!("fx_algo_grid_{}", fx_idx))
@@ -2725,6 +2569,22 @@ fn render_media_record_page(ui: &mut Ui, state: &mut Axios24State) {
                         {
                             state.media.source = src;
                         }
+                    }
+                    if draw_pill_button(
+                        ui,
+                        if state.virtual_soundcheck {
+                            "\u{f021} Virtual Soundcheck: USB 16x16 ON"
+                        } else {
+                            "\u{f021} Virtual Soundcheck (USB 16x16)"
+                        },
+                        state.virtual_soundcheck,
+                        Color32::from_rgb(243, 156, 18),
+                        Vec2::new(225.0, 24.0),
+                    )
+                    .on_hover_text("Armer MixHub 24: Alterna canais 1-16 entre entrada ao vivo e retorno multitrack USB 16x16")
+                    .clicked()
+                    {
+                        state.toggle_virtual_soundcheck();
                     }
                 });
 
@@ -2921,37 +2781,111 @@ fn render_media_record_page(ui: &mut Ui, state: &mut Axios24State) {
     });
 }
 
+fn render_single_dca_editor(ui: &mut Ui, state: &mut Axios24State, dca_idx: usize) {
+    let sel = SelectedChannel::Dca(dca_idx);
+    Frame::NONE
+        .fill(Color32::from_rgb(16, 21, 31))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::same(12))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(241, 196, 15)))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading(
+                    RichText::new(format!("CONFIGURAÇÃO DO DCA {} — {}", dca_idx + 1, state.channel_name(sel)))
+                        .size(15.0)
+                        .color(Color32::from_rgb(241, 196, 15)),
+                );
+                ui.separator();
+                let mut name = state.channel_name(sel).to_string();
+                ui.label("Nome:");
+                if ui.add_sized([150.0, 22.0], egui::TextEdit::singleline(&mut name)).changed() {
+                    state.set_channel_name(sel, name);
+                }
+                let mut f_db = state.channel_fader_db(sel);
+                let f_lbl = format_fader_db(f_db);
+                ui.label("Nível:");
+                if ui.add(egui::Slider::new(&mut f_db, -120.0..=10.0).text(f_lbl)).changed() {
+                    state.set_channel_fader_db(sel, f_db);
+                }
+                let muted = state.channel_muted(sel);
+                if draw_pill_button(ui, "MUTE DCA", muted, Color32::from_rgb(231, 76, 60), Vec2::new(85.0, 22.0)).clicked() {
+                    state.set_channel_muted(sel, !muted);
+                }
+                if ui.button("Limpar Todos").clicked() {
+                    state.clear_dca_group(dca_idx);
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Cor do DCA:");
+                draw_color_palette_grid(ui, state, sel, 16, 16.0);
+            });
+            ui.separator();
+            ui.label(RichText::new("Selecione os canais controlados por este DCA:").strong());
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
+                for ch in 0..38 {
+                    let ch_sel = SelectedChannel::from_flat_id(ch);
+                    let mem = state.is_in_dca_group(dca_idx, ch);
+                    if draw_pill_button(
+                        ui,
+                        state.channel_name(ch_sel),
+                        mem,
+                        Color32::from_rgb(241, 196, 15),
+                        Vec2::new(88.0, 24.0),
+                    )
+                    .clicked()
+                    {
+                        state.set_in_dca_group(dca_idx, ch, !mem);
+                    }
+                }
+            });
+        });
+}
+
 // =============================================================================
 // 6. SETTINGS & UTILITIES PAGE (Scenes, Copy, Mute/Phantom Groups, Signal, Network, System)
 // =============================================================================
 fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
-    ui.horizontal_wrapped(|ui| {
+    ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
         let sub_tabs = [
             (SettingsSubTab::Scene, "\u{f008} CENAS (SCENES)"),
             (SettingsSubTab::CopyPaste, "\u{f0c5} COPIAR CANAL"),
             (SettingsSubTab::MuteGroup, "\u{f026} GRUPO MUTE"),
+            (SettingsSubTab::DcaGroup, "\u{f0c1} DCA 1-4"),
             (SettingsSubTab::PhantomGroup, "\u{f0e7} GRUPO +48V"),
             (SettingsSubTab::Record, "\u{f111} ROTEAMENTO REC"),
             (SettingsSubTab::PhonesMonitor, "\u{f025} FONES / MONITOR"),
+            (SettingsSubTab::MoreMeMatrix, "\u{f028} MOREME / MATRIX"),
             (SettingsSubTab::SignalGen, "\u{f028} GERADOR DE SINAL"),
             (SettingsSubTab::Network, "\u{f1eb} REDE WI-FI / LAN"),
+            (SettingsSubTab::Midi, "\u{f001} MIDI USB"),
             (SettingsSubTab::Shortcuts, "\u{f11c} ATALHOS"),
             (SettingsSubTab::System, "\u{f013} SISTEMA"),
         ];
-        let btn_w = ((ui.available_width() - 9.0 * 5.0) / 10.0).clamp(92.0, 128.0);
-        for (st, lbl) in sub_tabs {
-            if draw_pill_button(
-                ui,
-                lbl,
-                state.settings_tab == st,
-                Color32::from_rgb(0, 165, 215),
-                Vec2::new(btn_w, 25.0),
-            )
-            .clicked()
-            {
-                state.settings_tab = st;
-            }
+        let avail_w = ui.available_width();
+        let row1_w = ((avail_w - 6.0 * 5.0) / 7.0).max(125.0);
+        let row2_w = ((avail_w - 5.0 * 5.0) / 6.0).max(140.0);
+        for (row_idx, row_items) in sub_tabs.chunks(7).enumerate() {
+            let btn_w = if row_idx == 0 { row1_w } else { row2_w };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                for &(st, lbl) in row_items {
+                    if draw_pill_button(
+                        ui,
+                        lbl,
+                        state.settings_tab == st,
+                        Color32::from_rgb(0, 165, 215),
+                        Vec2::new(btn_w, 27.0),
+                    )
+                    .clicked()
+                    {
+                        state.settings_tab = st;
+                    }
+                }
+            });
         }
     });
     ui.separator();
@@ -3065,6 +2999,87 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
                 }
             });
         }
+        SettingsSubTab::DcaGroup => {
+            ui.heading("Gerenciador Completo dos 4 Grupos DCA (DCA 1..4)");
+            ui.label(
+                RichText::new("Agrupe canais para controlar o volume e mute de todos juntos (ex: Bateria, Vozes, Metais).")
+                    .size(12.0),
+            );
+            ui.add_space(6.0);
+            ScrollArea::vertical().id_salt("dca_mgr_scroll").show(ui, |ui| {
+                ui.columns(4, |cols| {
+                    for dca in 0..4 {
+                        let dca_sel = SelectedChannel::Dca(dca);
+                        Frame::NONE
+                            .fill(Color32::from_rgb(16, 21, 31))
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(Margin::same(8))
+                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(241, 196, 15)))
+                            .show(&mut cols[dca], |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("DCA {}", dca + 1))
+                                            .strong()
+                                            .size(13.5)
+                                            .color(Color32::from_rgb(241, 196, 15)),
+                                    );
+                                    let mut name = state.channel_name(dca_sel).to_string();
+                                    if ui
+                                        .add_sized([95.0, 20.0], egui::TextEdit::singleline(&mut name))
+                                        .changed()
+                                    {
+                                        state.set_channel_name(dca_sel, name);
+                                    }
+                                });
+                                let mut f_db = state.channel_fader_db(dca_sel);
+                                let f_lbl = format_fader_db(f_db);
+                                if ui
+                                    .add(egui::Slider::new(&mut f_db, -120.0..=10.0).text(f_lbl))
+                                    .changed()
+                                {
+                                    state.set_channel_fader_db(dca_sel, f_db);
+                                }
+                                ui.horizontal(|ui| {
+                                    let muted = state.channel_muted(dca_sel);
+                                    if draw_pill_button(
+                                        ui,
+                                        "MUTE",
+                                        muted,
+                                        Color32::from_rgb(231, 76, 60),
+                                        Vec2::new(62.0, 22.0),
+                                    )
+                                    .clicked()
+                                    {
+                                        state.set_channel_muted(dca_sel, !muted);
+                                    }
+                                    if ui.small_button("Limpar").clicked() {
+                                        state.clear_dca_group(dca);
+                                    }
+                                });
+                                ui.separator();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                                    for ch in 0..38 {
+                                        let ch_sel = SelectedChannel::from_flat_id(ch);
+                                        let mem = state.is_in_dca_group(dca, ch);
+                                        if draw_pill_button(
+                                            ui,
+                                            state.channel_name(ch_sel),
+                                            mem,
+                                            Color32::from_rgb(241, 196, 15),
+                                            Vec2::new(66.0, 20.0),
+                                        )
+                                        .clicked()
+                                        {
+                                            state.set_in_dca_group(dca, ch, !mem);
+                                        }
+                                    }
+                                });
+                            });
+                    }
+                });
+            });
+        }
         SettingsSubTab::MuteGroup => {
             ui.heading("Configuração dos 4 Grupos de Mute (MUTE GROUP 1..4)");
             for mg in 0..4 {
@@ -3176,6 +3191,134 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
             {
                 state.set_phones_level_db(ph);
             }
+        }
+        SettingsSubTab::MoreMeMatrix => {
+            ui.columns(2, |cols| {
+                // Left: Soundcraft MoreMe (Personal Musician Monitor)
+                Frame::NONE
+                    .fill(Color32::from_rgb(16, 21, 31))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::same(12))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(26, 188, 156)))
+                    .show(&mut cols[0], |ui| {
+                        ui.heading(
+                            RichText::new("MoreMe — Retorno Pessoal do Músico (Soundcraft Ui24R)")
+                                .size(14.5)
+                                .color(Color32::from_rgb(26, 218, 176)),
+                        );
+                        ui.label(
+                            RichText::new("Ajuste seu próprio volume no retorno sem bagunçar o PA nem os outros músicos.")
+                                .size(12.0),
+                        );
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                            ui.label("Meu Canal:");
+                            egui::ComboBox::from_id_salt("more_me_ch")
+                                .selected_text(state.channel_name(SelectedChannel::Input(state.more_me_channel)))
+                                .show_ui(ui, |ui| {
+                                    for c in 0..24 {
+                                        let ch_lbl = format!("CH{} ({})", c + 1, state.channel_name(SelectedChannel::Input(c)));
+                                        ui.selectable_value(
+                                            &mut state.more_me_channel,
+                                            c,
+                                            ch_lbl,
+                                        );
+                                    }
+                                });
+                            ui.label("Meu Retorno (AUX):");
+                            egui::ComboBox::from_id_salt("more_me_aux")
+                                .selected_text(format!("AUX {}", state.more_me_aux + 1))
+                                .show_ui(ui, |ui| {
+                                    for a in 0..8 {
+                                        ui.selectable_value(&mut state.more_me_aux, a, format!("AUX {}", a + 1));
+                                    }
+                                });
+                        });
+                        ui.add_space(10.0);
+
+                        let mut my_db = state.input_aux_send_db(state.more_me_channel, state.more_me_aux);
+                        ui.label(
+                            RichText::new(format!(
+                                "MEU INSTRUMENTO / VOZ ({}): {}",
+                                state.channel_name(SelectedChannel::Input(state.more_me_channel)),
+                                format_fader_db(my_db)
+                            ))
+                            .strong()
+                            .size(13.5),
+                        );
+                        if ui
+                            .add(egui::Slider::new(&mut my_db, -120.0..=0.0).text("dB"))
+                            .changed()
+                        {
+                            state.set_input_aux_send_db(state.more_me_channel, state.more_me_aux, my_db);
+                        }
+
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("RESTO DA BANDA NO MEU RETORNO:").strong().size(13.0));
+                        ui.horizontal(|ui| {
+                            for (lbl, delta) in [("-3 dB Banda", -3.0_f32), ("-1 dB Banda", -1.0), ("+1 dB Banda", 1.0), ("+3 dB Banda", 3.0)] {
+                                if ui.button(lbl).clicked() {
+                                    state.adjust_more_me_band(delta);
+                                }
+                            }
+                        });
+                    });
+
+                // Right: Matrix Mix (Live Stream / Overflow Room)
+                Frame::NONE
+                    .fill(Color32::from_rgb(16, 21, 31))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::same(12))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0, 188, 212)))
+                    .show(&mut cols[1], |ui| {
+                        ui.heading(
+                            RichText::new("Matrix Mix — Saídas Secundárias (Live / Sala Auxiliar)")
+                                .size(14.5)
+                                .color(Color32::from_rgb(0, 215, 255)),
+                        );
+                        ui.label(
+                            RichText::new("Misture MAIN L/R, AUX e FX de forma independente para transmissão ou outra sala.")
+                                .size(12.0),
+                        );
+                        ui.separator();
+
+                        let mtx_names = ["MATRIX 1 (Transmissão / Live)", "MATRIX 2 (Sala Auxiliar / Lobby)"];
+                        let src_names = ["MAIN L/R", "AUX 1-2", "AUX 3-4", "FX 1-2"];
+                        for m in 0..2 {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(mtx_names[m]).strong());
+                                if draw_pill_button(
+                                    ui,
+                                    "MUTE",
+                                    state.matrix_muted[m],
+                                    Color32::from_rgb(231, 76, 60),
+                                    Vec2::new(60.0, 20.0),
+                                )
+                                .clicked()
+                                {
+                                    state.matrix_muted[m] = !state.matrix_muted[m];
+                                }
+                            });
+                            for s in 0..4 {
+                                let mut db = state.matrix_sends_db[m][s];
+                                let db_lbl = format_fader_db(db);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("  {} ->", src_names[s])).monospace());
+                                    if ui
+                                        .add(egui::Slider::new(&mut db, -120.0..=10.0).text(db_lbl))
+                                        .changed()
+                                    {
+                                        state.matrix_sends_db[m][s] = db;
+                                    }
+                                });
+                            }
+                            if m == 0 {
+                                ui.separator();
+                            }
+                        }
+                    });
+            });
         }
         SettingsSubTab::SignalGen => {
             ui.heading("Gerador de Sinal de Teste (SINE WAVE / PINK NOISE / WHITE NOISE)");
@@ -3330,6 +3473,104 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
                 });
             });
         }
+        SettingsSubTab::Midi => {
+            ui.heading("Controladora MIDI USB (Faders Físicos + MIDI Learn)");
+            ui.label(
+                RichText::new("Conecte uma controladora MIDI USB (ex: Korg nanoKONTROL, Behringer X-Touch, Akai) para controlar os faders com a mão. Padrão: CC 1..8 = Canais da camada, CC 9 = MAIN L/R.")
+                    .size(12.0),
+            );
+            ui.add_space(6.0);
+
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("\u{f021} Atualizar Portas MIDI").clicked() {
+                    state.midi.refresh_devices();
+                }
+                if state.midi.available_devices.is_empty() {
+                    ui.label(RichText::new("Nenhum dispositivo MIDI USB detectado.").color(Color32::from_rgb(243, 156, 18)));
+                } else {
+                    let cur_name = state
+                        .midi
+                        .available_devices
+                        .get(state.midi.selected_idx)
+                        .cloned()
+                        .unwrap_or_default();
+                    egui::ComboBox::from_id_salt("midi_dev_combo")
+                        .selected_text(cur_name)
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for (idx, name) in state.midi.available_devices.clone().into_iter().enumerate() {
+                                ui.selectable_value(&mut state.midi.selected_idx, idx, name);
+                            }
+                        });
+                    if state.midi.connected_name.is_some() {
+                        if ui.button("Desconectar MIDI").clicked() {
+                            state.midi.disconnect();
+                            state.toast("Controladora MIDI desconectada.");
+                        }
+                    } else if ui.button("\u{f0c1} Conectar MIDI").clicked() {
+                        match state.midi.connect(state.midi.selected_idx) {
+                            Ok(n) => state.toast(format!("MIDI conectado: {}", n)),
+                            Err(e) => state.toast(e),
+                        }
+                    }
+                }
+                ui.label(RichText::new(format!("Último evento: {}", state.midi.last_event_label)).monospace().size(11.5));
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                let sel = state.selected_channel;
+                let flat_id = sel.flat_id();
+                let learning_fader = state.midi.learn_target == Some((flat_id, false));
+                let learning_mute = state.midi.learn_target == Some((flat_id, true));
+                if draw_pill_button(
+                    ui,
+                    if learning_fader {
+                        "Mova um Fader/Knob MIDI agora..."
+                    } else {
+                        "MIDI Learn: Fader do Canal Selecionado"
+                    },
+                    learning_fader,
+                    Color32::from_rgb(0, 188, 212),
+                    Vec2::new(260.0, 26.0),
+                )
+                .clicked()
+                {
+                    state.midi.learn_target = if learning_fader { None } else { Some((flat_id, false)) };
+                }
+                if draw_pill_button(
+                    ui,
+                    if learning_mute {
+                        "Aperte um Botão MIDI agora..."
+                    } else {
+                        "MIDI Learn: Mute do Canal Selecionado"
+                    },
+                    learning_mute,
+                    Color32::from_rgb(231, 76, 60),
+                    Vec2::new(250.0, 26.0),
+                )
+                .clicked()
+                {
+                    state.midi.learn_target = if learning_mute { None } else { Some((flat_id, true)) };
+                }
+                if ui.button("Limpar Mapeamentos").clicked() {
+                    state.midi.bindings.clear();
+                    state.toast("Mapeamentos MIDI limpos.");
+                }
+            });
+
+            ui.add_space(6.0);
+            ScrollArea::vertical().id_salt("midi_bindings_scroll").show(ui, |ui| {
+                for (idx, b) in state.midi.bindings.clone().into_iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(b.label()).monospace().size(12.0));
+                        if ui.small_button("Remover").clicked() {
+                            state.midi.bindings.remove(idx);
+                        }
+                    });
+                }
+            });
+        }
         SettingsSubTab::Shortcuts => {
             ui.heading("Lista Completa de Atalhos de Teclado (Acesso Rápido)");
             ui.label(
@@ -3352,7 +3593,9 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
                         ("L", "Ligar / Desligar envio do canal para o Master L/R"),
                         ("P", "Alternar Pré / Pós Fader (quando em Sends on Fader AUX)"),
                         ("Ctrl + R", "Renomear canal selecionado inline"),
+                        ("Ctrl + Clique no Canal", "Juntar / Desjuntar canais em Link (sem mexer no Pan)"),
                         ("Ctrl + C / Ctrl + V", "Copiar / Colar configurações do canal selecionado"),
+                        ("Ctrl + Z", "Desfazer última troca de cena, preset ou colagem"),
                         ("Ctrl + D", "Ativar / Desativar DIM -20 dB no Master L/R"),
                         ("Ctrl + Shift + S", "Limpar todos os Solos ativos (CLR SOLO)"),
                     ],
@@ -3383,7 +3626,7 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
                         ("Ctrl + 5", "Ir para aba PLAYER & REC"),
                         ("Ctrl + 6", "Ir para aba CONFIG / CENAS"),
                         ("Ctrl + F", "Abrir / Fechar busca rápida de canais"),
-                        ("F8", "Alternar Modo de Visão (Normal / Analógico / Big Desktop)"),
+                        ("F8", "Alternar Modo de Visão (Normal / Analógico)"),
                         ("F9", "Ligar / Pausar Simulador DEMO"),
                         ("F10", "Abrir janela Conectar ao Mixer / Rede"),
                         ("F11", "Alternar Tema Escuro (Dark) / Claro (Light)"),
@@ -3392,29 +3635,50 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
                 ),
             ];
 
+            let draw_group = |ui: &mut Ui, title: &str, accent: Color32, items: &[(&str, &str)]| {
+                Frame::NONE
+                    .fill(if state.dark_theme {
+                        Color32::from_rgb(16, 21, 31)
+                    } else {
+                        Color32::from_rgb(228, 234, 244)
+                    })
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::same(10))
+                    .stroke(Stroke::new(1.0_f32, accent))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(title).size(13.5).strong().color(accent));
+                        ui.add_space(4.0);
+                        egui::Grid::new(title)
+                            .num_columns(2)
+                            .striped(true)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                for &(key, desc) in items {
+                                    ui.label(
+                                        RichText::new(key)
+                                            .monospace()
+                                            .strong()
+                                            .size(12.0)
+                                            .color(accent),
+                                    );
+                                    ui.add(egui::Label::new(RichText::new(desc).size(12.0)).wrap());
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            };
+
             ScrollArea::vertical().id_salt("shortcuts_scroll").show(ui, |ui| {
-                for (title, accent, items) in shortcut_groups {
-                    ui.label(RichText::new(title).size(14.0).strong().color(accent));
-                    ui.add_space(4.0);
-                    egui::Grid::new(title)
-                        .num_columns(2)
-                        .striped(true)
-                        .spacing([18.0, 6.0])
-                        .show(ui, |ui| {
-                            for &(key, desc) in items {
-                                ui.label(
-                                    RichText::new(key)
-                                        .monospace()
-                                        .strong()
-                                        .size(13.0)
-                                        .color(accent),
-                                );
-                                ui.label(RichText::new(desc).size(13.0));
-                                ui.end_row();
-                            }
-                        });
-                    ui.add_space(12.0);
-                }
+                ui.columns(2, |cols| {
+                    let (t1, a1, i1) = shortcut_groups[0];
+                    draw_group(&mut cols[0], t1, a1, i1);
+
+                    let (t2, a2, i2) = shortcut_groups[1];
+                    draw_group(&mut cols[1], t2, a2, i2);
+                    cols[1].add_space(8.0);
+                    let (t3, a3, i3) = shortcut_groups[2];
+                    draw_group(&mut cols[1], t3, a3, i3);
+                });
             });
         }
         SettingsSubTab::System => {

@@ -64,7 +64,6 @@ pub fn map_reg(group: u8, ch: usize, param: usize) -> usize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ViewMode {
-    BigDesktop,
     Normal,
     Analog,
 }
@@ -72,7 +71,6 @@ pub enum ViewMode {
 impl ViewMode {
     pub fn label(self) -> &'static str {
         match self {
-            ViewMode::BigDesktop => "Big Desktop",
             ViewMode::Normal => "Modo Normal",
             ViewMode::Analog => "Modo Analógico",
         }
@@ -105,11 +103,14 @@ pub enum SettingsSubTab {
     Scene,
     CopyPaste,
     MuteGroup,
+    DcaGroup,
     PhantomGroup,
     Record,
     PhonesMonitor,
+    MoreMeMatrix,
     SignalGen,
     Network,
+    Midi,
     Shortcuts,
     System,
 }
@@ -143,6 +144,15 @@ impl SelectedChannel {
             SelectedChannel::Fx(i) => 26 + i.min(1),
             SelectedChannel::Output(i) => 28 + i.min(9),
             SelectedChannel::Dca(i) => 38 + i.min(3),
+        }
+    }
+
+    pub fn from_flat_id(id: usize) -> Self {
+        match id {
+            0..=25 => SelectedChannel::Input(id),
+            26..=27 => SelectedChannel::Fx(id - 26),
+            28..=37 => SelectedChannel::Output(id - 28),
+            _ => SelectedChannel::Dca((id.saturating_sub(38)).min(3)),
         }
     }
 }
@@ -419,8 +429,10 @@ pub struct Axios24State {
     pub active_scene_idx: usize,
     pub scene_names: [String; 16],
     pub channel_names: [String; 60],
-    /// Custom strip color index per channel (0..8 palette) like DS Mixer
+    /// Custom strip color index per channel (0..32 palette) like DS Mixer
     pub channel_colors: [u8; 60],
+    /// Custom free channel link group per input channel (0 = none, 1..=4 = Group A..D; links all params except Pan!)
+    pub custom_link_groups: [u8; 24],
     /// 31-band Graphic EQ gains (-12.0 .. +12.0 dB) for each of the 10 Output channels (AUX1-8, MAIN L, MAIN R)
     pub output_geq_db: [[f32; 31]; 10],
     /// Whether GEQ is active on the output channel
@@ -485,6 +497,27 @@ pub struct Axios24State {
     pub connect_serial_port: String,
     pub available_serial_ports: Vec<String>,
 
+    // Soundcraft Ui24R / Armer MixHub 24 Pro Features (Tap Tempo, AFS2, MoreMe, Matrix, Virtual Soundcheck)
+    pub tap_tempo_bpm: f32,
+    pub tap_last_time: f64,
+    pub tap_subdivision: usize,
+    pub virtual_soundcheck: bool,
+    pub afs2_live_active: bool,
+    pub afs2_last_run: f64,
+    pub more_me_channel: usize,
+    pub more_me_aux: usize,
+    pub matrix_sends_db: [[f32; 4]; 2],
+    pub matrix_muted: [bool; 2],
+
+    // Forum Complaint Fixes: Recall Safe, Undo History, Comp GR Meter, Network Ping & USB MIDI
+    pub recall_safe_channels: [bool; 42],
+    pub undo_stack: Vec<([u16; NUM_REGS], String)>,
+    pub comp_gr_db: [f32; 60],
+    pub last_net_rx_time: f64,
+    pub net_ping_ms: u32,
+    pub net_link_lost: bool,
+    pub midi: crate::midi::MidiControllerEngine,
+
     // GitHub Auto-Update
     pub update_info: Option<crate::updater::ReleaseUpdateInfo>,
     pub update_status: String,
@@ -499,7 +532,11 @@ impl Axios24State {
     pub fn new() -> Self {
         let preset_bin_path = PathBuf::from("preset.bin");
         let scenes = load_or_create_preset_bin(&preset_bin_path);
-        let regs = scenes.first().copied().unwrap_or(DEFAULT_REGS);
+        let mut regs = scenes.first().copied().unwrap_or(DEFAULT_REGS);
+        // Enable MAIN L & R stereo link by default if not explicitly set
+        if regs[0xBCC] == 0 {
+            regs[0xBCC] |= 1 << 4;
+        }
 
         let scene_names = std::array::from_fn(|i| format!("Scene{}", i + 1));
         let mut channel_names = std::array::from_fn(|_| String::new());
@@ -543,6 +580,7 @@ impl Axios24State {
             scene_names,
             channel_names,
             channel_colors,
+            custom_link_groups: [0; 24],
             output_geq_db: [[0.0; 31]; 10],
             output_geq_enabled: [true; 10],
             view_mode: ViewMode::Normal,
@@ -596,6 +634,23 @@ impl Axios24State {
             connect_ip: "172.14.10.1".to_string(),
             connect_serial_port: default_port,
             available_serial_ports: ports,
+            tap_tempo_bpm: 120.0,
+            tap_last_time: 0.0,
+            tap_subdivision: 0,
+            virtual_soundcheck: false,
+            afs2_live_active: false,
+            afs2_last_run: 0.0,
+            more_me_channel: 0,
+            more_me_aux: 0,
+            matrix_sends_db: [[0.0, -120.0, -120.0, -120.0], [0.0, -120.0, -120.0, -120.0]],
+            matrix_muted: [false, false],
+            recall_safe_channels: [false; 42],
+            undo_stack: Vec::new(),
+            comp_gr_db: [0.0; 60],
+            last_net_rx_time: 0.0,
+            net_ping_ms: 0,
+            net_link_lost: false,
+            midi: crate::midi::MidiControllerEngine::default(),
             update_info: None,
             update_status: format!("Versão atual: v{}", crate::updater::CURRENT_VERSION),
             update_checking: false,
@@ -628,16 +683,31 @@ impl Axios24State {
         }
     }
 
-    /// Sets a channel parameter and automatically propagates to stereo-linked partner (fcn.0045c790)
+    /// Sets a channel parameter and automatically propagates to stereo-linked partner & custom link group (except Pan 0x0B)
     pub fn set_group_param(&mut self, group: u8, ch: usize, param: usize, val: u16) {
         let reg = map_reg(group, ch, param);
         self.set_reg(reg, val);
 
-        // Stereo link propagation (except Pan 0x0B)
-        if group == 1 && ch < 24 && param != 0x0B && self.is_input_stereo_linked(ch) {
-            let partner = ch ^ 1;
-            let partner_reg = map_reg(1, partner, param);
-            self.set_reg(partner_reg, val);
+        // Stereo link & Custom Channel Link propagation (NEVER touches Pan 0x0B)
+        if group == 1 && ch < 24 && param != 0x0B {
+            let stereo_partner = if self.is_input_stereo_linked(ch) {
+                let p = ch ^ 1;
+                self.set_reg(map_reg(1, p, param), val);
+                Some(p)
+            } else {
+                None
+            };
+            let custom_grp = self.custom_link_groups[ch];
+            if custom_grp != 0 {
+                for other in 0..24 {
+                    if other != ch
+                        && Some(other) != stereo_partner
+                        && self.custom_link_groups[other] == custom_grp
+                    {
+                        self.set_reg(map_reg(1, other, param), val);
+                    }
+                }
+            }
         } else if group == 1 && ch == 24 {
             // Stereo digital input (ch 24 & 25)
             let partner_reg = map_reg(1, 25, param);
@@ -663,7 +733,29 @@ impl Axios24State {
     }
 
     pub fn set_channel_color_idx(&mut self, ch: SelectedChannel, color_idx: u8) {
-        self.channel_colors[ch.flat_id()] = color_idx % 32;
+        let c = color_idx % 32;
+        self.channel_colors[ch.flat_id()] = c;
+        match ch {
+            SelectedChannel::Input(i) if i < 24 => {
+                if self.is_input_stereo_linked(i) {
+                    let partner = SelectedChannel::Input(i ^ 1);
+                    self.channel_colors[partner.flat_id()] = c;
+                }
+                let grp = self.custom_link_groups[i];
+                if grp != 0 {
+                    for other in 0..24 {
+                        if self.custom_link_groups[other] == grp {
+                            self.channel_colors[SelectedChannel::Input(other).flat_id()] = c;
+                        }
+                    }
+                }
+            }
+            SelectedChannel::Output(i) if i < 10 && self.is_output_stereo_linked(i) => {
+                let partner = SelectedChannel::Output(i ^ 1);
+                self.channel_colors[partner.flat_id()] = c;
+            }
+            _ => {}
+        }
     }
 
     // =========================================================================
@@ -705,6 +797,119 @@ impl Axios24State {
             cur & !(1 << pair)
         };
         self.set_reg(0xBCC, next);
+    }
+
+    pub fn input_custom_link_group(&self, ch: usize) -> u8 {
+        if ch < 24 {
+            self.custom_link_groups[ch]
+        } else {
+            0
+        }
+    }
+
+    pub fn set_input_custom_link_group(&mut self, ch: usize, grp: u8) {
+        if ch < 24 {
+            self.custom_link_groups[ch] = grp.min(4);
+        }
+    }
+
+    pub fn custom_link_group_label(grp: u8) -> &'static str {
+        match grp {
+            1 => "LNK A",
+            2 => "LNK B",
+            3 => "LNK C",
+            4 => "LNK D",
+            _ => "—",
+        }
+    }
+
+    /// Returns a short badge label if this channel is stereo-linked or in a custom link group
+    pub fn channel_link_badge(&self, sel: SelectedChannel) -> Option<String> {
+        match sel {
+            SelectedChannel::Input(ch) if ch < 24 => {
+                let st = self.is_input_stereo_linked(ch);
+                let cg = self.input_custom_link_group(ch);
+                match (st, cg) {
+                    (true, 0) => Some("LNK".to_string()),
+                    (false, g) if g > 0 => Some(Self::custom_link_group_label(g).to_string()),
+                    (true, g) if g > 0 => Some(format!("LNK+{}", (b'A' + g - 1) as char)),
+                    _ => None,
+                }
+            }
+            SelectedChannel::Output(ch) if ch < 10 && self.is_output_stereo_linked(ch) => {
+                Some("LNK".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Windows-style Ctrl+Click channel linking: joins/toggles channels in a custom link group without touching Pan
+    pub fn ctrl_link_channel(&mut self, clicked: SelectedChannel) {
+        let sel = self.selected_channel;
+        match (sel, clicked) {
+            (SelectedChannel::Input(a), SelectedChannel::Input(b)) if a < 24 && b < 24 => {
+                if a == b {
+                    if self.custom_link_groups[a] != 0 {
+                        self.custom_link_groups[a] = 0;
+                        self.toast(format!("{} removido do link", self.channel_name(clicked)));
+                    }
+                    return;
+                }
+                let grp = if self.custom_link_groups[a] != 0 {
+                    self.custom_link_groups[a]
+                } else {
+                    (1..=4u8)
+                        .find(|&g| !self.custom_link_groups.contains(&g))
+                        .unwrap_or(1)
+                };
+
+                self.custom_link_groups[a] = grp;
+                if self.custom_link_groups[b] == grp {
+                    self.custom_link_groups[b] = 0;
+                    let remaining: Vec<usize> = (0..24)
+                        .filter(|&i| self.custom_link_groups[i] == grp)
+                        .collect();
+                    if remaining.len() <= 1 {
+                        for i in remaining {
+                            self.custom_link_groups[i] = 0;
+                        }
+                        self.toast(format!(
+                            "Link Grupo {} desfeito (menos de 2 canais)",
+                            (b'A' + grp - 1) as char
+                        ));
+                    } else {
+                        self.toast(format!(
+                            "{} removido do Grupo {}",
+                            self.channel_name(clicked),
+                            (b'A' + grp - 1) as char
+                        ));
+                    }
+                } else {
+                    self.custom_link_groups[b] = grp;
+                    let members: Vec<String> = (0..24)
+                        .filter(|&i| self.custom_link_groups[i] == grp)
+                        .map(|i| self.channel_name(SelectedChannel::Input(i)).to_string())
+                        .collect();
+                    self.toast(format!(
+                        "Grupo {} (Sem Pan): {}",
+                        (b'A' + grp - 1) as char,
+                        members.join(" + ")
+                    ));
+                }
+            }
+            (SelectedChannel::Output(a), SelectedChannel::Output(b)) if a < 10 && b < 10 && (a ^ 1) == b => {
+                let next = !self.is_output_stereo_linked(a);
+                self.set_output_stereo_linked(a, next);
+                self.toast(if next {
+                    "Par de saída linkado!"
+                } else {
+                    "Par de saída deslinkado!"
+                });
+            }
+            _ => {
+                self.selected_channel = clicked;
+            }
+        }
     }
 
     // =========================================================================
@@ -1142,7 +1347,7 @@ impl Axios24State {
         ((self.get_reg(reg) >> 15) & 1) != 0
     }
 
-    pub fn set_channel_muted(&mut self, sel: SelectedChannel, muted: bool) {
+    fn set_single_channel_muted(&mut self, sel: SelectedChannel, muted: bool) {
         let (group, ch) = sel.group_and_index();
         if group == 4 {
             self.set_group_param(4, ch, 0xD9, if muted { 1 } else { 0 });
@@ -1160,6 +1365,59 @@ impl Axios24State {
         self.set_reg(reg, next);
         if !(group == 3 && (ch == 8 || ch == 9)) {
             self.set_reg(reg + 1, next);
+        }
+    }
+
+    pub fn set_channel_muted(&mut self, sel: SelectedChannel, muted: bool) {
+        self.set_single_channel_muted(sel, muted);
+        let (group, ch) = sel.group_and_index();
+        if group == 1 && ch < 24 {
+            let stereo_partner = if self.is_input_stereo_linked(ch) {
+                let p = ch ^ 1;
+                self.set_single_channel_muted(SelectedChannel::Input(p), muted);
+                Some(p)
+            } else {
+                None
+            };
+            let custom_grp = self.custom_link_groups[ch];
+            if custom_grp != 0 {
+                for other in 0..24 {
+                    if other != ch
+                        && Some(other) != stereo_partner
+                        && self.custom_link_groups[other] == custom_grp
+                    {
+                        self.set_single_channel_muted(SelectedChannel::Input(other), muted);
+                    }
+                }
+            }
+        } else if group == 3 && ch < 10 && self.is_output_stereo_linked(ch) {
+            self.set_single_channel_muted(SelectedChannel::Output(ch ^ 1), muted);
+        }
+    }
+
+    pub fn set_output_geq_enabled(&mut self, out_idx: usize, en: bool) {
+        let idx = out_idx.min(9);
+        self.output_geq_enabled[idx] = en;
+        if self.is_output_stereo_linked(idx) {
+            self.output_geq_enabled[(idx ^ 1).min(9)] = en;
+        }
+    }
+
+    pub fn set_output_geq_db(&mut self, out_idx: usize, band: usize, db: f32) {
+        let idx = out_idx.min(9);
+        let b = band.min(30);
+        let clamped = (db.clamp(-12.0, 12.0) * 10.0).round() / 10.0;
+        self.output_geq_db[idx][b] = clamped;
+        if self.is_output_stereo_linked(idx) {
+            self.output_geq_db[(idx ^ 1).min(9)][b] = clamped;
+        }
+    }
+
+    pub fn reset_output_geq(&mut self, out_idx: usize) {
+        let idx = out_idx.min(9);
+        self.output_geq_db[idx] = [0.0; 31];
+        if self.is_output_stereo_linked(idx) {
+            self.output_geq_db[(idx ^ 1).min(9)] = [0.0; 31];
         }
     }
 
@@ -1331,6 +1589,90 @@ impl Axios24State {
         self.set_reg(reg, next);
     }
 
+    pub fn clear_dca_group(&mut self, dca_idx: usize) {
+        for flat_ch in 0..38 {
+            self.set_in_dca_group(dca_idx, flat_ch, false);
+        }
+        self.toast(format!("DCA {} limpo!", dca_idx + 1));
+    }
+
+    /// Soundcraft Ui24R Tap Tempo: calculates BPM & sets FX Delay time
+    pub fn tap_tempo_hit(&mut self, fx_idx: usize) {
+        let now = self.sim_time;
+        let dt = now - self.tap_last_time;
+        self.tap_last_time = now;
+        if (0.25..=2.0).contains(&dt) {
+            let bpm = (60.0 / dt as f32).clamp(40.0, 240.0);
+            self.tap_tempo_bpm = (bpm * 10.0).round() / 10.0;
+        }
+        self.apply_tap_tempo_to_fx(fx_idx);
+    }
+
+    pub fn apply_tap_tempo_to_fx(&mut self, fx_idx: usize) {
+        let mult = match self.tap_subdivision {
+            1 => 0.5,   // 1/8
+            2 => 0.75,  // 1/8 dotted (U2 style)
+            3 => 0.25,  // 1/16
+            _ => 1.0,   // 1/4
+        };
+        let delay_ms = (60_000.0 / self.tap_tempo_bpm.max(40.0)) * mult;
+        let val = delay_ms.round().clamp(10.0, 1000.0) as u16;
+        self.set_fx_param1(fx_idx, val);
+        self.toast(format!(
+            "Tap Tempo FX{}: {:.1} BPM ({:.0} ms)",
+            fx_idx + 1,
+            self.tap_tempo_bpm,
+            delay_ms
+        ));
+    }
+
+    /// Soundcraft AFS2 Live Feedback Hunter: scans RTA peak and attenuates feedback ring with narrow notch
+    pub fn run_afs2_feedback_hunt(&mut self) {
+        let peak_hz = self.rta_peak_freq_hz.clamp(60.0, 16000.0);
+        let sel = self.selected_channel;
+        let (grp, ch) = sel.group_and_index();
+        if grp == 1 || grp == 3 {
+            self.set_eq_enabled(grp, ch, true);
+            let band = if grp == 1 { 3 } else { 6 };
+            let mut b = self.peq_band(grp, ch, band);
+            b.mode = PeqBandMode::Peaking;
+            b.freq_hz = peak_hz;
+            b.gain_db = -9.0;
+            b.q = 18.0;
+            self.set_peq_band(grp, ch, band, b);
+            self.toast(format!("AFS2 Notch aplicado em {:.0} Hz (-9 dB, Q=18)", peak_hz));
+        }
+    }
+
+    /// Armer MixHub 24 Virtual Soundcheck (toggles input source between Live XLR/P10 & USB Multitrack 16x16)
+    pub fn toggle_virtual_soundcheck(&mut self) {
+        self.virtual_soundcheck = !self.virtual_soundcheck;
+        if self.virtual_soundcheck {
+            self.set_input_to_main_lr(24, true);
+            self.set_channel_muted(SelectedChannel::Input(24), false);
+        }
+        self.toast(if self.virtual_soundcheck {
+            "Virtual Soundcheck ATIVO: Retorno USB 16x16 habilitado para passagem de som!"
+        } else {
+            "Virtual Soundcheck DESATIVADO: Entradas em modo ao vivo XLR/P10"
+        });
+    }
+
+    /// Soundcraft MoreMe: adjusts all OTHER channels in the chosen AUX bus ("Band" level) while preserving the user's own channel
+    pub fn adjust_more_me_band(&mut self, delta_db: f32) {
+        let aux = self.more_me_aux.min(7);
+        let my_ch = self.more_me_channel.min(24);
+        for ch in 0..24 {
+            if ch != my_ch {
+                let cur = self.input_aux_send_db(ch, aux);
+                if cur > -115.0 {
+                    let next = (cur + delta_db).clamp(-120.0, 0.0);
+                    self.set_input_aux_send_db(ch, aux, next);
+                }
+            }
+        }
+    }
+
     /// Mute group membership (mg_idx 0..3, flat_ch 0..41)
     pub fn is_in_mute_group(&self, mg_idx: usize, flat_ch: usize) -> bool {
         let base = map_reg(5, mg_idx.min(3), 0xE3);
@@ -1465,12 +1807,70 @@ impl Axios24State {
     // =========================================================================
     // SCENES & COPY/PASTE (preset.bin & .scn compatibility)
     // =========================================================================
+    pub fn push_undo(&mut self, desc: impl Into<String>) {
+        if self.undo_stack.len() >= 25 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push((self.regs, desc.into()));
+    }
+
+    pub fn undo(&mut self) {
+        if let Some((prev_regs, desc)) = self.undo_stack.pop() {
+            self.regs = prev_regs;
+            self.scenes[self.active_scene_idx] = prev_regs;
+            let _ = save_preset_bin(&self.preset_bin_path, &self.scenes);
+            self.sync_full_console_to_hardware();
+            self.toast(format!("Desfeito: {}", desc));
+        } else {
+            self.toast("Nada para desfazer.");
+        }
+    }
+
+    fn save_auto_backup(&self) {
+        let backup_path = self.preset_bin_path.with_file_name("preset_backup.bin");
+        let _ = save_preset_bin(&backup_path, &self.scenes);
+    }
+
     pub fn recall_scene(&mut self, idx: usize) {
         if idx < 16 {
+            self.push_undo(format!("Troca para Cena {}", idx + 1));
+            self.save_auto_backup();
+            let prev_regs = self.regs;
             self.active_scene_idx = idx;
             self.regs = self.scenes[idx];
+
+            // Restore Recall Safe channels so protected mics/playback never change!
+            for flat_id in 0..42 {
+                if self.recall_safe_channels[flat_id] {
+                    let sel = SelectedChannel::from_flat_id(flat_id);
+                    let (grp, ch) = sel.group_and_index();
+                    let param_range = match grp {
+                        1 => 0..0x3E,
+                        2 => 0xAB..0xD8,
+                        3 => 0..0x6D,
+                        _ => 0..9,
+                    };
+                    for p in param_range {
+                        let r = map_reg(grp, ch, p);
+                        if r < NUM_REGS {
+                            self.regs[r] = prev_regs[r];
+                        }
+                    }
+                }
+            }
+
             self.hw_link.send_frame(build_scene_op_frame((idx + 1) as u8, false));
-            self.toast(format!("Cena {} ({}) carregada!", idx + 1, self.scene_names[idx]));
+            let safe_cnt = self.recall_safe_channels.iter().filter(|&&s| s).count();
+            if safe_cnt > 0 {
+                self.toast(format!(
+                    "Cena {} ({}) carregada ({} canal(is) em Recall Safe mantidos)!",
+                    idx + 1,
+                    self.scene_names[idx],
+                    safe_cnt
+                ));
+            } else {
+                self.toast(format!("Cena {} ({}) carregada!", idx + 1, self.scene_names[idx]));
+            }
         }
     }
 
@@ -1486,6 +1886,8 @@ impl Axios24State {
 
     pub fn reset_scene_to_default(&mut self, idx: usize) {
         if idx < 16 {
+            self.push_undo(format!("Reset Cena {}", idx + 1));
+            self.save_auto_backup();
             self.scenes[idx] = DEFAULT_REGS;
             if self.active_scene_idx == idx {
                 self.regs = DEFAULT_REGS;
@@ -1512,6 +1914,8 @@ impl Axios24State {
         };
 
         if let Some(scn) = decode_official_scn(&bytes) {
+            self.push_undo(format!("Importar {}", scn.name));
+            self.save_auto_backup();
             self.regs = scn.regs;
             let idx = self.active_scene_idx;
             self.scenes[idx] = scn.regs;
@@ -1542,6 +1946,7 @@ impl Axios24State {
 
     /// Channel Copy/Paste (fcn.00443170 / 00443390 / 004435e0)
     pub fn paste_channel_from(&mut self, src: SelectedChannel, dst: SelectedChannel) {
+        self.push_undo(format!("Colar canal em {}", self.channel_name(dst)));
         match (src, dst) {
             (SelectedChannel::Input(s), SelectedChannel::Input(d)) if s < 24 && d < 24 => {
                 for p in 0..0x3E {
@@ -1567,6 +1972,75 @@ impl Axios24State {
     // =========================================================================
     // DEMO MODE SIMULATION & HARDWARE SYNC
     // =========================================================================
+    pub fn apply_dynamics_preset(&mut self, sel: SelectedChannel, preset_idx: usize) {
+        self.push_undo("Preset Dinâmica".to_string());
+        let (group, ch) = sel.group_and_index();
+        let c_grp = if group == 3 { 3 } else { 1 };
+        let c_ch = if group == 3 { ch } else { ch.min(25) };
+        match preset_idx {
+            0 => {
+                // Voz Suave
+                if c_grp == 1 {
+                    self.set_input_gate_enabled(c_ch, true);
+                    self.set_input_gate_threshold_db(c_ch, -48.0);
+                    self.set_input_gate_attack_ms(c_ch, 5.0);
+                    self.set_input_gate_release_ms(c_ch, 180.0);
+                }
+                self.set_comp_enabled(c_grp, c_ch, true);
+                self.set_comp_threshold_db(c_grp, c_ch, -18.0);
+                self.set_comp_ratio(c_grp, c_ch, 3.0);
+                self.set_comp_attack_ms(c_grp, c_ch, 12.0);
+                self.set_comp_release_ms(c_grp, c_ch, 140.0);
+                self.toast("Dinâmica: Voz Suave aplicada!");
+            }
+            1 => {
+                // Bumbo Seco
+                if c_grp == 1 {
+                    self.set_input_gate_enabled(c_ch, true);
+                    self.set_input_gate_threshold_db(c_ch, -34.0);
+                    self.set_input_gate_attack_ms(c_ch, 1.0);
+                    self.set_input_gate_release_ms(c_ch, 90.0);
+                }
+                self.set_comp_enabled(c_grp, c_ch, true);
+                self.set_comp_threshold_db(c_grp, c_ch, -16.0);
+                self.set_comp_ratio(c_grp, c_ch, 4.5);
+                self.set_comp_attack_ms(c_grp, c_ch, 15.0);
+                self.set_comp_release_ms(c_grp, c_ch, 80.0);
+                self.toast("Dinâmica: Bumbo Seco aplicada!");
+            }
+            2 => {
+                // Locução / Pastor
+                if c_grp == 1 {
+                    self.set_input_gate_enabled(c_ch, true);
+                    self.set_input_gate_threshold_db(c_ch, -52.0);
+                    self.set_input_gate_attack_ms(c_ch, 8.0);
+                    self.set_input_gate_release_ms(c_ch, 240.0);
+                }
+                self.set_comp_enabled(c_grp, c_ch, true);
+                self.set_comp_threshold_db(c_grp, c_ch, -22.0);
+                self.set_comp_ratio(c_grp, c_ch, 4.0);
+                self.set_comp_attack_ms(c_grp, c_ch, 6.0);
+                self.set_comp_release_ms(c_grp, c_ch, 160.0);
+                self.toast("Dinâmica: Locução / Pastor aplicada!");
+            }
+            _ => {
+                if c_grp == 1 {
+                    self.set_input_gate_enabled(c_ch, false);
+                }
+                self.set_comp_enabled(c_grp, c_ch, false);
+                self.toast("Dinâmica em Bypass!");
+            }
+        }
+    }
+
+    pub fn reconnect_last_hardware(&mut self) {
+        let mode = self.hw_link.mode.clone();
+        self.hw_link.connect(mode);
+        self.last_net_rx_time = self.sim_time;
+        self.net_link_lost = false;
+        self.toast("Reconectando à mesa...");
+    }
+
     pub fn set_demo_running(&mut self, run: bool) {
         self.demo_running = run;
         self.hw_link.send_frame(build_demo_cmd_frame(run));
@@ -1685,10 +2159,12 @@ impl Axios24State {
             }
         }
 
-        // Poll hardware events
+        // Poll hardware events & monitor ping/link health
+        let mut got_hw_packet = false;
         for ev in self.hw_link.poll_events() {
             match ev {
                 NetEvent::ParamUpdates(pairs) => {
+                    got_hw_packet = true;
                     for (reg, val) in pairs {
                         if (reg as usize) < NUM_REGS {
                             self.regs[reg as usize] = val;
@@ -1696,16 +2172,105 @@ impl Axios24State {
                     }
                 }
                 NetEvent::DeviceDiscovered(dev) => {
+                    got_hw_packet = true;
                     if !self.discovered_devices.iter().any(|d| d.ip == dev.ip) {
                         self.discovered_devices.push(dev);
                     }
                 }
                 NetEvent::Connected(info) => {
+                    got_hw_packet = true;
                     self.toast(format!("Conectado: {}", info));
                 }
                 NetEvent::Error(err) => {
+                    self.net_link_lost = true;
                     self.toast(err);
                 }
+            }
+        }
+        if got_hw_packet {
+            let gap = ((self.sim_time - self.last_net_rx_time) * 1000.0).round() as u32;
+            self.net_ping_ms = gap.clamp(1, 999);
+            self.last_net_rx_time = self.sim_time;
+            self.net_link_lost = false;
+        } else if !matches!(self.hw_link.mode, crate::protocol::ConnectionMode::Demo) {
+            let silent_secs = self.sim_time - self.last_net_rx_time;
+            if silent_secs > 4.5 {
+                self.net_link_lost = true;
+            }
+        } else {
+            self.net_link_lost = false;
+            self.net_ping_ms = 0;
+        }
+
+        // Poll USB MIDI controller messages (Faders / Mutes / MIDI Learn)
+        for msg in self.midi.poll_messages() {
+            let kind = msg.kind();
+            let is_cc = kind == 0xB0;
+            let is_note = kind == 0x90 && msg.data2 > 0;
+            if !is_cc && !is_note {
+                continue;
+            }
+            let ch = msg.channel();
+            self.midi.last_event_label = format!(
+                "Ch{} {} #{} Val {}",
+                ch + 1,
+                if is_note { "Note" } else { "CC" },
+                msg.data1,
+                msg.data2
+            );
+            if let Some((target_id, is_mute)) = self.midi.learn_target.take() {
+                self.midi.bindings.retain(|b| {
+                    !(b.channel == ch && b.is_note == is_note && b.number == msg.data1)
+                });
+                self.midi.bindings.push(crate::midi::MidiBinding {
+                    channel: ch,
+                    is_note,
+                    number: msg.data1,
+                    target_flat_id: target_id,
+                    is_mute,
+                });
+                self.toast(format!("MIDI Learn gravado: {}", self.midi.last_event_label));
+                continue;
+            }
+
+            let matched: Vec<(usize, bool)> = self
+                .midi
+                .bindings
+                .iter()
+                .filter(|b| b.channel == ch && b.is_note == is_note && b.number == msg.data1)
+                .map(|b| (b.target_flat_id, b.is_mute))
+                .collect();
+            if !matched.is_empty() {
+                for (flat_id, is_mute) in matched {
+                    let target_sel = SelectedChannel::from_flat_id(flat_id);
+                    if is_mute {
+                        let m = self.channel_muted(target_sel);
+                        self.set_channel_muted(target_sel, !m);
+                    } else if is_cc {
+                        let norm = (msg.data2 as f32) / 127.0;
+                        let db = if norm <= 0.01 {
+                            -120.0
+                        } else {
+                            (-60.0 + norm * 70.0).clamp(-120.0, 10.0)
+                        };
+                        self.set_effective_fader_db(target_sel, (db * 10.0).round() / 10.0);
+                    }
+                }
+            } else if is_cc && (1..=8).contains(&msg.data1) {
+                // Built-in default mapping: CC 1..8 control the first 8 channels of current layer!
+                let base_offset = match self.layer {
+                    FaderLayer::Ch9_16 => 8,
+                    FaderLayer::Ch17_24 => 16,
+                    _ => 0,
+                };
+                let target_sel = SelectedChannel::Input(base_offset + (msg.data1 as usize - 1));
+                let norm = (msg.data2 as f32) / 127.0;
+                let db = if norm <= 0.01 { -120.0 } else { (-60.0 + norm * 70.0).clamp(-120.0, 10.0) };
+                self.set_effective_fader_db(target_sel, (db * 10.0).round() / 10.0);
+            } else if is_cc && msg.data1 == 9 {
+                let norm = (msg.data2 as f32) / 127.0;
+                let db = if norm <= 0.01 { -120.0 } else { (-60.0 + norm * 70.0).clamp(-120.0, 10.0) };
+                self.set_channel_fader_db(SelectedChannel::Output(8), (db * 10.0).round() / 10.0);
             }
         }
 
@@ -1764,6 +2329,18 @@ impl Axios24State {
                 } else {
                     (prev - dt * 28.0).max(level)
                 };
+
+                // Compute live Compressor Gain Reduction (GR) in dB
+                let (c_grp, c_ch) = sel.group_and_index();
+                if (c_grp == 1 || c_grp == 3) && self.comp_enabled(c_grp, c_ch) {
+                    let th = self.comp_threshold_db(c_grp, c_ch);
+                    let ratio = self.comp_ratio(c_grp, c_ch).max(1.0);
+                    let over = (self.channel_meters_db[i] - th).max(0.0);
+                    let gr = over * (1.0 - 1.0 / ratio);
+                    self.comp_gr_db[i] = gr.clamp(0.0, 24.0);
+                } else {
+                    self.comp_gr_db[i] = 0.0;
+                }
             }
 
             // RTA 64-band spectrum shaped by the currently selected channel's EQ!
@@ -2145,6 +2722,7 @@ impl Axios24State {
 
     /// Applies a complete studio Channel Preset (HPF + 4-Band PEQ + Gate + Compressor)
     pub fn apply_channel_preset(&mut self, sel: SelectedChannel, preset: ChannelPreset) {
+        self.push_undo(format!("Preset {}", preset.label()));
         let (group, ch) = sel.group_and_index();
         let g = group.max(1).min(3);
         let c = if group == 4 { 0 } else { ch };
@@ -2153,6 +2731,7 @@ impl Axios24State {
             ChannelPreset::FlatReset => {
                 self.reset_peq(g, c);
                 if g == 1 {
+                    self.set_input_preamp_gain_db(c, 0.0);
                     self.set_input_gate_enabled(c, false);
                     self.set_comp_enabled(1, c, false);
                 }
@@ -2166,28 +2745,38 @@ impl Axios24State {
                 self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 3200.0, gain_db: 2.5, q: 1.4 });
                 self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 10500.0, gain_db: 2.0, q: 1.0 });
                 if g == 1 {
+                    self.set_input_preamp_gain_db(c, 26.0);
                     self.set_input_gate_enabled(c, true);
-                    self.set_input_gate_threshold_db(c, -52.0);
+                    self.set_input_gate_threshold_db(c, -54.0);
+                    self.set_input_gate_attack_ms(c, 5.0);
+                    self.set_input_gate_release_ms(c, 180.0);
                     self.set_comp_enabled(1, c, true);
                     self.set_comp_threshold_db(1, c, -18.0);
                     self.set_comp_ratio(1, c, 3.2);
+                    self.set_comp_attack_ms(1, c, 12.0);
+                    self.set_comp_release_ms(1, c, 140.0);
                     self.set_comp_gain_db(1, c, 2.5);
                 }
             }
             ChannelPreset::VocalFeminino => {
                 self.set_eq_enabled(g, c, true);
-                self.set_hpf_freq_hz(g, c, 115.0);
+                self.set_hpf_freq_hz(g, c, 120.0);
                 self.set_lpf_freq_hz(g, c, 18500.0);
                 self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 260.0, gain_db: -2.5, q: 2.0 });
                 self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 2400.0, gain_db: -1.5, q: 2.8 });
                 self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 4200.0, gain_db: 2.0, q: 1.5 });
                 self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 11500.0, gain_db: 3.0, q: 1.0 });
                 if g == 1 {
+                    self.set_input_preamp_gain_db(c, 26.0);
                     self.set_input_gate_enabled(c, true);
-                    self.set_input_gate_threshold_db(c, -54.0);
+                    self.set_input_gate_threshold_db(c, -55.0);
+                    self.set_input_gate_attack_ms(c, 5.0);
+                    self.set_input_gate_release_ms(c, 180.0);
                     self.set_comp_enabled(1, c, true);
                     self.set_comp_threshold_db(1, c, -18.0);
                     self.set_comp_ratio(1, c, 3.0);
+                    self.set_comp_attack_ms(1, c, 12.0);
+                    self.set_comp_release_ms(1, c, 150.0);
                     self.set_comp_gain_db(1, c, 2.0);
                 }
             }
@@ -2200,113 +2789,167 @@ impl Axios24State {
                 self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 2800.0, gain_db: 3.0, q: 1.4 });
                 self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 6800.0, gain_db: -3.0, q: 4.5 });
                 if g == 1 {
+                    self.set_input_preamp_gain_db(c, 28.0);
                     self.set_input_gate_enabled(c, true);
-                    self.set_input_gate_threshold_db(c, -48.0);
+                    self.set_input_gate_threshold_db(c, -50.0);
+                    self.set_input_gate_attack_ms(c, 8.0);
+                    self.set_input_gate_release_ms(c, 240.0);
                     self.set_comp_enabled(1, c, true);
                     self.set_comp_threshold_db(1, c, -20.0);
                     self.set_comp_ratio(1, c, 4.0);
+                    self.set_comp_attack_ms(1, c, 8.0);
+                    self.set_comp_release_ms(1, c, 160.0);
                     self.set_comp_gain_db(1, c, 3.0);
                 }
             }
             ChannelPreset::BumboKick => {
                 self.set_eq_enabled(g, c, true);
                 self.set_hpf_freq_hz(g, c, 35.0);
-                self.set_lpf_freq_hz(g, c, 12000.0);
+                self.set_lpf_freq_hz(g, c, 10000.0);
                 self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 62.0, gain_db: 4.5, q: 1.6 });
                 self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 320.0, gain_db: -6.0, q: 2.4 });
                 self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 3800.0, gain_db: 4.0, q: 1.8 });
                 self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 8000.0, gain_db: -2.0, q: 1.0 });
                 if g == 1 {
+                    self.set_input_preamp_gain_db(c, 16.0);
                     self.set_input_gate_enabled(c, true);
-                    self.set_input_gate_threshold_db(c, -38.0);
+                    self.set_input_gate_threshold_db(c, -36.0);
+                    self.set_input_gate_attack_ms(c, 3.0);
+                    self.set_input_gate_release_ms(c, 90.0);
                     self.set_comp_enabled(1, c, true);
                     self.set_comp_threshold_db(1, c, -16.0);
                     self.set_comp_ratio(1, c, 4.5);
+                    self.set_comp_attack_ms(1, c, 15.0);
+                    self.set_comp_release_ms(1, c, 80.0);
                     self.set_comp_gain_db(1, c, 3.0);
                 }
             }
             ChannelPreset::CaixaSnare => {
                 self.set_eq_enabled(g, c, true);
-                self.set_hpf_freq_hz(g, c, 75.0);
-                self.set_lpf_freq_hz(g, c, 16000.0);
+                self.set_hpf_freq_hz(g, c, 80.0);
+                self.set_lpf_freq_hz(g, c, 15000.0);
                 self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 190.0, gain_db: 3.0, q: 1.8 });
                 self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 520.0, gain_db: -4.5, q: 2.8 });
                 self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 4500.0, gain_db: 3.5, q: 1.4 });
                 self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 9000.0, gain_db: 2.5, q: 1.0 });
                 if g == 1 {
+                    self.set_input_preamp_gain_db(c, 16.0);
                     self.set_input_gate_enabled(c, true);
                     self.set_input_gate_threshold_db(c, -40.0);
+                    self.set_input_gate_attack_ms(c, 3.0);
+                    self.set_input_gate_release_ms(c, 110.0);
                     self.set_comp_enabled(1, c, true);
                     self.set_comp_threshold_db(1, c, -16.0);
                     self.set_comp_ratio(1, c, 4.0);
+                    self.set_comp_attack_ms(1, c, 12.0);
+                    self.set_comp_release_ms(1, c, 100.0);
                     self.set_comp_gain_db(1, c, 2.5);
                 }
             }
             ChannelPreset::TonsSurdo => {
                 self.set_eq_enabled(g, c, true);
                 self.set_hpf_freq_hz(g, c, 55.0);
+                self.set_lpf_freq_hz(g, c, 12000.0);
                 self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 110.0, gain_db: 3.5, q: 1.8 });
                 self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 420.0, gain_db: -5.5, q: 2.5 });
                 self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 4200.0, gain_db: 3.0, q: 1.6 });
                 self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 10000.0, gain_db: 1.0, q: 1.0 });
                 if g == 1 {
+                    self.set_input_preamp_gain_db(c, 18.0);
                     self.set_input_gate_enabled(c, true);
                     self.set_input_gate_threshold_db(c, -42.0);
+                    self.set_comp_enabled(1, c, true);
+                    self.set_comp_threshold_db(1, c, -16.0);
+                    self.set_comp_ratio(1, c, 3.5);
                 }
             }
             ChannelPreset::OverheadsPratos => {
                 self.set_eq_enabled(g, c, true);
                 self.set_hpf_freq_hz(g, c, 320.0);
+                self.set_lpf_freq_hz(g, c, 20000.0);
                 self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 480.0, gain_db: -3.5, q: 2.0 });
                 self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 2800.0, gain_db: -2.0, q: 2.5 });
                 self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 7500.0, gain_db: 1.5, q: 1.4 });
                 self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 12000.0, gain_db: 3.0, q: 1.0 });
+                if g == 1 {
+                    self.set_input_preamp_gain_db(c, 22.0);
+                    self.set_input_gate_enabled(c, false);
+                    self.set_comp_enabled(1, c, false);
+                }
             }
             ChannelPreset::BaixoEletrico => {
                 self.set_eq_enabled(g, c, true);
-                self.set_hpf_freq_hz(g, c, 40.0);
-                self.set_lpf_freq_hz(g, c, 8500.0);
-                self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 85.0, gain_db: 3.5, q: 1.6 });
-                self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 280.0, gain_db: -3.5, q: 2.2 });
-                self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 950.0, gain_db: 2.5, q: 1.8 });
-                self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 2400.0, gain_db: 2.0, q: 1.6 });
+                self.set_hpf_freq_hz(g, c, 35.0);
+                self.set_lpf_freq_hz(g, c, 6000.0);
+                self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 75.0, gain_db: 3.0, q: 1.6 });
+                self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 250.0, gain_db: -3.5, q: 2.2 });
+                self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 900.0, gain_db: 2.5, q: 1.8 });
+                self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 2200.0, gain_db: 1.5, q: 1.6 });
                 if g == 1 {
+                    self.set_input_preamp_gain_db(c, 12.0);
+                    self.set_input_gate_enabled(c, false);
                     self.set_comp_enabled(1, c, true);
                     self.set_comp_threshold_db(1, c, -18.0);
-                    self.set_comp_ratio(1, c, 4.5);
+                    self.set_comp_ratio(1, c, 4.0);
+                    self.set_comp_attack_ms(1, c, 30.0);
+                    self.set_comp_release_ms(1, c, 100.0);
                     self.set_comp_gain_db(1, c, 3.0);
                 }
             }
             ChannelPreset::ViolaoAco => {
                 self.set_eq_enabled(g, c, true);
-                self.set_hpf_freq_hz(g, c, 90.0);
-                self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 185.0, gain_db: -4.0, q: 2.4 });
-                self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 420.0, gain_db: -2.5, q: 2.2 });
-                self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 3600.0, gain_db: 2.0, q: 1.5 });
-                self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 10000.0, gain_db: 3.0, q: 1.0 });
+                self.set_hpf_freq_hz(g, c, 110.0);
+                self.set_lpf_freq_hz(g, c, 16000.0);
+                self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 220.0, gain_db: -4.0, q: 4.5 });
+                self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 450.0, gain_db: -2.5, q: 2.4 });
+                self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 3800.0, gain_db: 2.0, q: 1.5 });
+                self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 10000.0, gain_db: 2.5, q: 1.0 });
                 if g == 1 {
+                    self.set_input_preamp_gain_db(c, 20.0);
+                    self.set_input_gate_enabled(c, false);
                     self.set_comp_enabled(1, c, true);
-                    self.set_comp_threshold_db(1, c, -18.0);
-                    self.set_comp_ratio(1, c, 3.0);
+                    self.set_comp_threshold_db(1, c, -16.0);
+                    self.set_comp_ratio(1, c, 2.5);
+                    self.set_comp_attack_ms(1, c, 15.0);
+                    self.set_comp_release_ms(1, c, 80.0);
                     self.set_comp_gain_db(1, c, 1.5);
                 }
             }
             ChannelPreset::GuitarraEletrica => {
                 self.set_eq_enabled(g, c, true);
-                self.set_hpf_freq_hz(g, c, 85.0);
-                self.set_lpf_freq_hz(g, c, 9500.0);
+                self.set_hpf_freq_hz(g, c, 90.0);
+                self.set_lpf_freq_hz(g, c, 7500.0);
                 self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 160.0, gain_db: 1.5, q: 1.8 });
                 self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 450.0, gain_db: -2.5, q: 2.2 });
-                self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 2200.0, gain_db: 2.5, q: 1.6 });
-                self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 4200.0, gain_db: -2.0, q: 3.0 });
+                self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 2200.0, gain_db: 2.0, q: 1.6 });
+                self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 3800.0, gain_db: -2.5, q: 3.0 });
+                if g == 1 {
+                    self.set_input_preamp_gain_db(c, 18.0);
+                    self.set_input_gate_enabled(c, true);
+                    self.set_input_gate_threshold_db(c, -52.0);
+                    self.set_comp_enabled(1, c, true);
+                    self.set_comp_threshold_db(1, c, -14.0);
+                    self.set_comp_ratio(1, c, 2.0);
+                }
             }
             ChannelPreset::TecladoPiano => {
                 self.set_eq_enabled(g, c, true);
-                self.set_hpf_freq_hz(g, c, 65.0);
-                self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 250.0, gain_db: -2.5, q: 2.0 });
-                self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 650.0, gain_db: -1.5, q: 2.0 });
-                self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 3200.0, gain_db: 2.0, q: 1.4 });
-                self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 10500.0, gain_db: 2.5, q: 1.0 });
+                self.set_hpf_freq_hz(g, c, 70.0);
+                self.set_lpf_freq_hz(g, c, 18000.0);
+                self.set_peq_band(g, c, 0, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 320.0, gain_db: -2.5, q: 2.0 });
+                self.set_peq_band(g, c, 1, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 1400.0, gain_db: -1.5, q: 2.0 });
+                self.set_peq_band(g, c, 2, PeqBandData { mode: PeqBandMode::Peaking, freq_hz: 3500.0, gain_db: 1.5, q: 1.4 });
+                self.set_peq_band(g, c, 3, PeqBandData { mode: PeqBandMode::HighShelf, freq_hz: 8500.0, gain_db: 2.0, q: 1.0 });
+                if g == 1 {
+                    self.set_input_preamp_gain_db(c, 10.0);
+                    self.set_input_gate_enabled(c, false);
+                    self.set_comp_enabled(1, c, true);
+                    self.set_comp_threshold_db(1, c, -12.0);
+                    self.set_comp_ratio(1, c, 2.0);
+                    self.set_comp_attack_ms(1, c, 5.0);
+                    self.set_comp_release_ms(1, c, 100.0);
+                    self.set_comp_gain_db(1, c, 0.0);
+                }
             }
         }
         self.toast(format!(

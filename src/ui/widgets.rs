@@ -45,8 +45,8 @@ pub const STRIP_PALETTE: [Color32; 32] = [
     Color32::from_rgb(155, 89, 182),  // 27: Amethyst Purple
     Color32::from_rgb(142, 68, 173),  // 28: Deep Purple
     Color32::from_rgb(124, 77, 255),  // 29: Violet
-    Color32::from_rgb(120, 144, 156), // 30: Steel Slate
-    Color32::from_rgb(189, 195, 199), // 31: Silver
+    Color32::from_rgb(15, 17, 22),    // 30: Black
+    Color32::from_rgb(245, 248, 252), // 31: White
 ];
 
 /// Colors for each EQ band node & curve (HPF, Band 1..7, LPF)
@@ -947,10 +947,29 @@ pub fn draw_comp_curve_graph(
         painter.circle_filled(sig_pos, 4.5, Color32::from_rgb(0, 235, 255));
     }
 
+    let gr_db = if enabled && input_meter_db > *threshold_db {
+        ((input_meter_db - *threshold_db) * (1.0 - 1.0 / ratio.max(1.0))).clamp(0.0, 20.0)
+    } else {
+        0.0
+    };
+    if gr_db > 0.05 {
+        let gr_bar_w = 6.0;
+        let gr_h = (gr_db / 20.0) * plot.height();
+        let gr_rect = Rect::from_min_size(
+            Pos2::new(plot.right() - gr_bar_w - 2.0, plot.top()),
+            Vec2::new(gr_bar_w, gr_h),
+        );
+        painter.rect_filled(gr_rect, CornerRadius::same(2), Color32::from_rgb(231, 76, 60));
+    }
+
     painter.text(
         Pos2::new(plot.left() + 4.0, plot.top() + 4.0),
         Align2::LEFT_TOP,
-        format!("COMP {:.1}:1 | TH:{:.1}dB", ratio, *threshold_db),
+        if gr_db > 0.1 {
+            format!("COMP {:.1}:1 | GR -{:.1}dB", ratio, gr_db)
+        } else {
+            format!("COMP {:.1}:1 | TH:{:.1}dB", ratio, *threshold_db)
+        },
         FontId::proportional(10.5),
         col,
     );
@@ -1359,28 +1378,51 @@ pub fn draw_channel_strip(
 
     let (rect, strip_resp) = ui.allocate_exact_size(Vec2::new(strip_w, strip_height), Sense::click());
     if strip_resp.clicked() {
-        state.selected_channel = sel;
+        if ui.input(|i| i.modifiers.command) {
+            state.ctrl_link_channel(sel);
+        } else {
+            state.selected_channel = sel;
+        }
     }
 
     let painter = ui.painter_at(rect);
     let dark = state.dark_theme;
-    let bg_col = if is_selected {
-        if dark { Color32::from_rgb(24, 33, 48) } else { Color32::from_rgb(218, 232, 248) }
+    let base_bg = if is_selected {
+        if dark { Color32::from_rgb(22, 30, 44) } else { Color32::from_rgb(218, 232, 248) }
     } else if is_master_section {
         if dark { Color32::from_rgb(16, 24, 36) } else { Color32::from_rgb(225, 233, 245) }
     } else if dark {
-        Color32::from_rgb(18, 23, 33)
+        Color32::from_rgb(16, 21, 30)
     } else {
         Color32::from_rgb(236, 240, 246)
     };
+    let tint_alpha = if is_master_section {
+        0.16_f32
+    } else if is_selected {
+        if dark { 0.34 } else { 0.38 }
+    } else if dark {
+        0.24
+    } else {
+        0.28
+    };
+    let blend_ch = |a: u8, b: u8, t: f32| -> u8 {
+        ((a as f32) * (1.0 - t) + (b as f32) * t).round().clamp(0.0, 255.0) as u8
+    };
+    let bg_col = Color32::from_rgb(
+        blend_ch(base_bg.r(), strip_color.r(), tint_alpha),
+        blend_ch(base_bg.g(), strip_color.g(), tint_alpha),
+        blend_ch(base_bg.b(), strip_color.b(), tint_alpha),
+    );
+    let bg_luma = (bg_col.r() as u16 * 299 + bg_col.g() as u16 * 587 + bg_col.b() as u16 * 114) / 1000;
+    let text_is_light = bg_luma < 145;
     let border_col = if is_selected {
-        Color32::from_rgb(0, 195, 235)
+        Color32::from_rgb(0, 225, 255)
     } else if is_master_section {
         Color32::from_rgb(0, 140, 180)
     } else if dark {
-        Color32::from_rgb(36, 46, 62)
+        Color32::from_rgb(48, 60, 78)
     } else {
-        Color32::from_rgb(185, 196, 212)
+        Color32::from_rgb(175, 188, 206)
     };
     painter.rect_filled(rect, CornerRadius::same(6), bg_col);
     painter.rect_stroke(
@@ -1471,12 +1513,16 @@ pub fn draw_channel_strip(
             state.renaming_channel = Some(sel);
             state.rename_buffer = ch_name;
         } else if hdr_resp.clicked() {
-            state.selected_channel = sel;
-            if state.clipboard_channel.is_some()
-                && state.settings_tab == crate::model::SettingsSubTab::CopyPaste
-            {
-                if let Some(src) = state.clipboard_channel {
-                    state.paste_channel_from(src, sel);
+            if child_ui.input(|i| i.modifiers.command) {
+                state.ctrl_link_channel(sel);
+            } else {
+                state.selected_channel = sel;
+                if state.clipboard_channel.is_some()
+                    && state.settings_tab == crate::model::SettingsSubTab::CopyPaste
+                {
+                    if let Some(src) = state.clipboard_channel {
+                        state.paste_channel_from(src, sel);
+                    }
                 }
             }
         }
@@ -1484,11 +1530,18 @@ pub fn draw_channel_strip(
     }
 
     // For Master Dock strips, always keep full fader throw clean and uncluttered;
-    // for channel bank strips, render mode-specific upper controls if vertical space permits.
+    // for channel bank strips, render horizontal Gain bar + mode-specific upper controls.
     if !is_master_section {
+        if group == 1 && ch < 24 && strip_height >= 160.0 {
+            let mut gain_db = state.input_preamp_gain_db(ch);
+            if draw_horizontal_gain_bar(&mut child_ui, &mut gain_db, inner_w, text_is_light) {
+                state.set_input_preamp_gain_db(ch, gain_db);
+                state.selected_channel = sel;
+            }
+        }
         match view_mode {
             crate::model::ViewMode::Normal => {
-                if group == 1 && ch < 24 && strip_height >= 260.0 {
+                if group == 1 && ch < 24 && strip_height >= 330.0 {
                     child_ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         let btn_w = (inner_w - 2.0) * 0.5;
@@ -1500,6 +1553,7 @@ pub fn draw_channel_strip(
                             Color32::from_rgb(231, 76, 60),
                             Vec2::new(btn_w, 16.0),
                         )
+                        .on_hover_text("Phantom Power +48V: Alimenta microfones condensadores e Direct Box ativos (com proteção anti-estalo)")
                         .clicked()
                         {
                             state.set_input_phantom_48v(ch, !p48);
@@ -1512,12 +1566,13 @@ pub fn draw_channel_strip(
                             Color32::from_rgb(243, 156, 18),
                             Vec2::new(btn_w, 16.0),
                         )
+                        .on_hover_text("Inversão de Fase (180°): Corrige cancelamento de áudio entre microfones próximos")
                         .clicked()
                         {
                             state.set_input_phase_invert(ch, !inv);
                         }
                     });
-                } else if group == 3 && strip_height >= 260.0 {
+                } else if group == 3 && strip_height >= 330.0 {
                     let inv = state.output_phase_invert(ch);
                     if draw_pill_button(
                         &mut child_ui,
@@ -1526,6 +1581,7 @@ pub fn draw_channel_strip(
                         Color32::from_rgb(243, 156, 18),
                         Vec2::new(inner_w, 16.0),
                     )
+                    .on_hover_text("Inversão de Fase (180°) desta saída")
                     .clicked()
                     {
                         state.set_output_phase_invert(ch, !inv);
@@ -1533,7 +1589,7 @@ pub fn draw_channel_strip(
                 }
 
                 // Mini EQ Curve Thumbnail (for Inputs, FX, Outputs)
-                if group <= 3 && strip_height >= 220.0 {
+                if group <= 3 && strip_height >= 320.0 {
                     if draw_mini_eq_thumbnail(
                         &mut child_ui,
                         state,
@@ -1541,6 +1597,7 @@ pub fn draw_channel_strip(
                         ch,
                         Vec2::new(inner_w, 28.0),
                     )
+                    .on_hover_text("Mini Curva de Equalização: Clique para abrir o Equalizador completo (PEQ / RTA)")
                     .clicked()
                     {
                         state.selected_channel = sel;
@@ -1549,7 +1606,7 @@ pub fn draw_channel_strip(
                 }
 
                 // Gate / Comp / EQ status pills
-                if group == 1 && strip_height >= 290.0 {
+                if group == 1 && strip_height >= 330.0 {
                     child_ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         let w3 = (inner_w - 4.0) / 3.0;
@@ -1561,6 +1618,7 @@ pub fn draw_channel_strip(
                             Color32::from_rgb(46, 204, 113),
                             Vec2::new(w3, 16.0),
                         )
+                        .on_hover_text("Noise Gate: Corta ruídos e vazamentos abaixo do Threshold")
                         .clicked()
                         {
                             state.set_input_gate_enabled(ch, !g_on);
@@ -1574,6 +1632,7 @@ pub fn draw_channel_strip(
                             Color32::from_rgb(243, 156, 18),
                             Vec2::new(w3, 16.0),
                         )
+                        .on_hover_text("Compressor Dinâmico: Controla picos e mantém o volume mais estável")
                         .clicked()
                         {
                             state.set_comp_enabled(1, ch, !c_on);
@@ -1587,13 +1646,14 @@ pub fn draw_channel_strip(
                             Color32::from_rgb(0, 188, 212),
                             Vec2::new(w3, 16.0),
                         )
+                        .on_hover_text("Equalizador Paramétrico (PEQ): Liga ou desliga o EQ deste canal")
                         .clicked()
                         {
                             state.set_eq_enabled(1, ch, !e_on);
                             state.selected_channel = sel;
                         }
                     });
-                } else if group == 3 && strip_height >= 290.0 {
+                } else if group == 3 && strip_height >= 330.0 {
                     child_ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         let w2 = (inner_w - 2.0) * 0.5;
@@ -1605,6 +1665,7 @@ pub fn draw_channel_strip(
                             Color32::from_rgb(243, 156, 18),
                             Vec2::new(w2, 16.0),
                         )
+                        .on_hover_text("Compressor da Saída: Controla picos e protege caixas/fones")
                         .clicked()
                         {
                             state.set_comp_enabled(3, ch, !c_on);
@@ -1618,6 +1679,7 @@ pub fn draw_channel_strip(
                             Color32::from_rgb(0, 188, 212),
                             Vec2::new(w2, 16.0),
                         )
+                        .on_hover_text("Equalizador Paramétrico (PEQ) desta saída")
                         .clicked()
                         {
                             state.set_eq_enabled(3, ch, !e_on);
@@ -1762,28 +1824,15 @@ pub fn draw_channel_strip(
                     }
                 }
             }
-            crate::model::ViewMode::BigDesktop => {
-                if group <= 3 && strip_height >= 190.0 {
-                    if draw_mini_eq_thumbnail(
-                        &mut child_ui,
-                        state,
-                        group,
-                        ch,
-                        Vec2::new(inner_w, 22.0),
-                    )
-                    .clicked()
-                    {
-                        state.selected_channel = sel;
-                    }
-                }
-            }
         }
     } else if group <= 3 && strip_height >= 220.0 {
         // Master L & R mini EQ curve thumbnail at the top of the right dock
         if draw_mini_eq_thumbnail(&mut child_ui, state, group, ch, Vec2::new(inner_w, 24.0))
+            .on_hover_text("Clique para abrir o Equalizador (PEQ 7 bandas + GEQ 31 bandas) do MAIN L/R")
             .clicked()
         {
             state.selected_channel = sel;
+            state.top_tab = crate::model::TopNavTab::PeqGeq;
         }
     }
 
@@ -1853,8 +1902,9 @@ pub fn draw_channel_strip(
                 "S",
                 is_solo,
                 Color32::from_rgb(243, 156, 18),
-                Vec2::new((inner_w - 2.0) * 0.40, 20.0),
+                Vec2::new((inner_w - 2.0) * 0.34, 20.0),
             )
+            .on_hover_text("Solo (PFL): Ouve apenas este canal nos fones de monitoração sem afetar o PA (Atalho: tecla S)")
             .clicked()
             {
                 state.set_channel_solo(sel, !is_solo);
@@ -1863,7 +1913,7 @@ pub fn draw_channel_strip(
         let mute_w = if group == 4 {
             inner_w
         } else {
-            (inner_w - 2.0) * 0.60
+            (inner_w - 2.0) * 0.66
         };
         if draw_pill_button(
             ui,
@@ -1872,6 +1922,7 @@ pub fn draw_channel_strip(
             Color32::from_rgb(231, 76, 60),
             Vec2::new(mute_w, 20.0),
         )
+        .on_hover_text("Mute: Silencia imediatamente este canal (Atalho: tecla M)")
         .clicked()
         {
             state.set_channel_muted(sel, !is_muted);
@@ -1905,10 +1956,10 @@ pub fn draw_channel_strip(
         egui::RichText::new(format_fader_db(fader_db))
             .size(10.0)
             .monospace()
-            .color(if dark {
-                Color32::from_rgb(185, 205, 225)
+            .color(if text_is_light {
+                Color32::from_rgb(215, 228, 245)
             } else {
-                Color32::from_rgb(30, 45, 65)
+                Color32::from_rgb(20, 30, 48)
             }),
     );
 
@@ -1949,12 +2000,17 @@ pub fn draw_channel_strip(
         Stroke::new(1.0_f32, strip_color),
         StrokeKind::Inside,
     );
+    let bottom_txt = if let Some(lnk) = state.channel_link_badge(sel) {
+        format!("\u{f0c1} {} {}", badge_lbl, lnk)
+    } else {
+        badge_lbl.clone()
+    };
     painter.text(
         scribble_rect.center(),
         Align2::CENTER_CENTER,
-        &badge_lbl,
-        FontId::proportional(10.5),
-        if dark { Color32::WHITE } else { Color32::from_rgb(15, 22, 34) },
+        &bottom_txt,
+        FontId::proportional(10.0),
+        if text_is_light { Color32::WHITE } else { Color32::from_rgb(15, 22, 34) },
     );
     let scribble_resp = ui.interact(
         scribble_rect,
@@ -1966,9 +2022,90 @@ pub fn draw_channel_strip(
         state.renaming_channel = Some(sel);
         state.rename_buffer = state.channel_name(sel).to_string();
     } else if scribble_resp.clicked() {
-        state.selected_channel = sel;
+        if ui.input(|i| i.modifiers.command) {
+            state.ctrl_link_channel(sel);
+        } else {
+            state.selected_channel = sel;
+        }
     }
     show_channel_context_menu(&scribble_resp, state, sel);
+}
+
+fn draw_horizontal_gain_bar(
+    ui: &mut Ui,
+    gain_db: &mut f32,
+    width: f32,
+    text_is_light: bool,
+) -> bool {
+    let size = Vec2::new(width.max(32.0), 14.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let resp = resp.on_hover_text(
+        "Ganho do Pré-Amplificador (0 a +60 dB): Arraste na horizontal para ajustar a sensibilidade. Duplo clique zera (0 dB)",
+    );
+    let mut changed = false;
+
+    if resp.double_clicked() {
+        *gain_db = 0.0;
+        changed = true;
+    } else if resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let norm = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            *gain_db = (norm * 60.0).round();
+            changed = true;
+        }
+    } else if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > 0.1 {
+            *gain_db = (*gain_db + scroll.signum()).clamp(0.0, 60.0);
+            changed = true;
+        }
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(3), Color32::from_rgb(12, 16, 24));
+    let norm = (*gain_db / 60.0).clamp(0.0, 1.0);
+    if norm > 0.005 {
+        let fill_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width() * norm, rect.height()));
+        let fill_col = if *gain_db >= 48.0 {
+            Color32::from_rgb(231, 76, 60)
+        } else if *gain_db >= 32.0 {
+            Color32::from_rgb(230, 126, 34)
+        } else {
+            Color32::from_rgb(211, 84, 0)
+        };
+        painter.rect_filled(fill_rect, CornerRadius::same(3), fill_col);
+    }
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(3),
+        Stroke::new(
+            1.0_f32,
+            if resp.hovered() {
+                Color32::from_rgb(255, 160, 60)
+            } else {
+                Color32::from_rgb(48, 60, 78)
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    let label = if width < 62.0 {
+        format!("G +{:.0}", *gain_db)
+    } else {
+        format!("GAIN +{:.0}dB", *gain_db)
+    };
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(9.5),
+        if text_is_light || norm > 0.35 {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(220, 230, 245)
+        },
+    );
+
+    changed
 }
 
 pub fn draw_color_palette_grid(
@@ -2031,6 +2168,46 @@ fn show_channel_context_menu(resp: &Response, state: &mut Axios24State, sel: Sel
         draw_color_palette_grid(ui, state, sel, 8, 17.0);
 
         let (group, ch) = sel.group_and_index();
+        if (group == 1 && ch < 24) || (group == 3 && ch < 10) {
+            ui.separator();
+            ui.label(egui::RichText::new("Link de Canais (Sem mexer no Pan):").size(11.0).strong());
+            let pair_a = (ch / 2) * 2;
+            let is_st = if group == 1 {
+                state.is_input_stereo_linked(ch)
+            } else {
+                state.is_output_stereo_linked(ch)
+            };
+            let pair_lbl = if group == 1 {
+                format!("\u{f0c1} Link Par CH{}+{} ({})", pair_a + 1, pair_a + 2, if is_st { "ON" } else { "OFF" })
+            } else if ch >= 8 {
+                format!("\u{f0c1} Link MAIN L & R ({})", if is_st { "ON" } else { "OFF" })
+            } else {
+                format!("\u{f0c1} Link AUX{}+{} ({})", pair_a + 1, pair_a + 2, if is_st { "ON" } else { "OFF" })
+            };
+            if ui.button(pair_lbl).clicked() {
+                if group == 1 {
+                    state.set_input_stereo_linked(ch, !is_st);
+                } else {
+                    state.set_output_stereo_linked(ch, !is_st);
+                }
+            }
+            if group == 1 && ch < 24 {
+                let cur_g = state.input_custom_link_group(ch);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Juntar:").size(10.5));
+                    for g in 0..=4u8 {
+                        let lbl = if g == 0 {
+                            "Off".to_string()
+                        } else {
+                            format!("{}", (b'A' + g - 1) as char)
+                        };
+                        if ui.selectable_label(cur_g == g, lbl).clicked() {
+                            state.set_input_custom_link_group(ch, g);
+                        }
+                    }
+                });
+            }
+        }
         if group == 1 {
             if let crate::model::SendsOnFaderTarget::Aux(aux_idx) = state.sends_on_fader {
                 ui.separator();
@@ -2049,7 +2226,44 @@ fn show_channel_context_menu(resp: &Response, state: &mut Axios24State, sel: Sel
             }
         }
 
+        if group != 4 {
+            let flat_id = sel.flat_id();
+            if flat_id < 38 {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("DCA:").size(11.0).strong());
+                    for dca in 0..4 {
+                        let mem = state.is_in_dca_group(dca, flat_id);
+                        if ui.selectable_label(mem, format!("D{}", dca + 1)).clicked() {
+                            state.set_in_dca_group(dca, flat_id, !mem);
+                        }
+                    }
+                });
+            }
+        } else {
+            ui.separator();
+            if ui.button("\u{f085} Configurar Canais do DCA").clicked() {
+                state.top_tab = crate::model::TopNavTab::Settings;
+                state.settings_tab = crate::model::SettingsSubTab::DcaGroup;
+                ui.close_menu();
+            }
+        }
+
         ui.separator();
+        let flat_id = sel.flat_id();
+        if flat_id < 42 {
+            let safe = state.recall_safe_channels[flat_id];
+            if ui
+                .button(if safe {
+                    "\u{f023} Recall Safe: ATIVO (Destravar)"
+                } else {
+                    "\u{f09c} Recall Safe (Travar na troca de cena)"
+                })
+                .clicked()
+            {
+                state.recall_safe_channels[flat_id] = !safe;
+            }
+        }
         if ui.button("\u{f0c5} Copiar Canal").clicked() {
             state.clipboard_channel = Some(sel);
             state.toast(format!("Canal {} copiado!", state.channel_name(sel)));

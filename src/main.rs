@@ -3,6 +3,7 @@
 pub mod audio_rta;
 pub mod default_scene;
 pub mod dsp;
+pub mod midi;
 pub mod model;
 pub mod protocol;
 pub mod ui;
@@ -137,6 +138,10 @@ fn configure_theme(ctx: &egui::Context, dark: bool) {
     visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0, 175, 215);
     visuals.selection.bg_fill = egui::Color32::from_rgb(0, 160, 205);
     ctx.set_visuals(visuals);
+    ctx.style_mut(|s| {
+        s.interaction.tooltip_delay = 0.6;
+        s.interaction.show_tooltips_only_when_still = true;
+    });
 }
 
 fn main() -> eframe::Result<()> {
@@ -279,5 +284,78 @@ mod tests {
         assert_eq!(info.version, "0.2.5");
         assert!(info.notes.contains("Novo EQ"));
         assert!(info.download_url.ends_with(".exe"));
+    }
+
+    #[test]
+    fn test_channel_links_preserve_pan() {
+        use crate::model::{Axios24State, SelectedChannel};
+        let mut st = Axios24State::new();
+        // 1. MAIN L & R link moves both together (Fader, Mute, EQ, GEQ)
+        assert!(st.is_output_stereo_linked(8));
+        st.set_channel_fader_db(SelectedChannel::Output(8), -5.5);
+        assert!((st.channel_fader_db(SelectedChannel::Output(9)) - (-5.5)).abs() < 0.2);
+        st.set_channel_muted(SelectedChannel::Output(8), true);
+        assert!(st.channel_muted(SelectedChannel::Output(9)));
+        st.set_channel_muted(SelectedChannel::Output(8), false);
+        st.set_output_geq_db(8, 10, 4.5);
+        assert!((st.output_geq_db[9][10] - 4.5).abs() < 0.1);
+        let mut bd = st.peq_band(3, 8, 0);
+        bd.gain_db = 3.5;
+        st.set_peq_band(3, 8, 0, bd);
+        assert!((st.peq_band(3, 9, 0).gain_db - 3.5).abs() < 0.15);
+
+        // 2. Custom link group (e.g. CH 14 & CH 15 for Stereo Keyboard) links everything EXCEPT Pan
+        st.set_input_pan(13, -100);
+        st.set_input_pan(14, 100);
+        st.set_input_custom_link_group(13, 1);
+        st.set_input_custom_link_group(14, 1);
+
+        st.set_channel_fader_db(SelectedChannel::Input(13), -3.0);
+        assert!((st.channel_fader_db(SelectedChannel::Input(14)) - (-3.0)).abs() < 0.2);
+        st.set_input_preamp_gain_db(13, 24.0);
+        assert!((st.input_preamp_gain_db(14) - 24.0).abs() < 0.5);
+        // Pan must remain completely independent!
+        assert_eq!(st.input_pan(13), -100);
+        assert_eq!(st.input_pan(14), 100);
+
+        // 3. Windows-style Ctrl+Click joins CH 16 into the same group, and Ctrl+Click again removes it
+        st.selected_channel = SelectedChannel::Input(13);
+        st.ctrl_link_channel(SelectedChannel::Input(15));
+        assert_eq!(st.input_custom_link_group(15), 1);
+        // Changing color on one linked channel propagates to all linked partners
+        st.set_channel_color_idx(SelectedChannel::Input(13), 21);
+        assert_eq!(st.channel_color_idx(SelectedChannel::Input(14)), 21);
+        assert_eq!(st.channel_color_idx(SelectedChannel::Input(15)), 21);
+        // MAIN L & R color sync
+        st.set_channel_color_idx(SelectedChannel::Output(8), 30);
+        assert_eq!(st.channel_color_idx(SelectedChannel::Output(9)), 30);
+
+        st.ctrl_link_channel(SelectedChannel::Input(15));
+        assert_eq!(st.input_custom_link_group(15), 0);
+
+        // 4. DCA group assignment & clear
+        st.set_in_dca_group(0, 4, true);
+        assert!(st.is_in_dca_group(0, 4));
+        st.clear_dca_group(0);
+        assert!(!st.is_in_dca_group(0, 4));
+    }
+
+    #[test]
+    fn test_recall_safe_and_undo() {
+        use crate::model::{Axios24State, SelectedChannel};
+        let mut st = Axios24State::new();
+        // Protect CH1 (flat_id 0) with Recall Safe and set fader to -2.0 dB
+        st.recall_safe_channels[0] = true;
+        st.set_channel_fader_db(SelectedChannel::Input(0), -2.0);
+        st.set_channel_fader_db(SelectedChannel::Input(1), -12.0);
+
+        // Recall Scene 2 (which has default fader values)
+        st.recall_scene(1);
+        // CH1 must remain at -2.0 dB because of Recall Safe!
+        assert!((st.channel_fader_db(SelectedChannel::Input(0)) - (-2.0)).abs() < 0.2);
+
+        // Undo must restore CH2 back to -12.0 dB
+        st.undo();
+        assert!((st.channel_fader_db(SelectedChannel::Input(1)) - (-12.0)).abs() < 0.2);
     }
 }

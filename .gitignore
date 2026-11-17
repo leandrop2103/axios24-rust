@@ -7,5 +7,6 @@
 *.log
 *.scn
 preset.bin
+preset_backup.bin
 .DS_Store
 Thumbs.db
