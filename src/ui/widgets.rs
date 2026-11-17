@@ -1324,7 +1324,20 @@ pub fn draw_pill_button(
     active_bg: Color32,
     size: Vec2,
 ) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let text_col = if active {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(185, 198, 215)
+    };
+    let font = FontId::proportional(10.5);
+    let text_w = ui.painter().layout_no_wrap(label.to_string(), font.clone(), text_col).size().x;
+    // Toolbar pills (>= 65px) auto-grow to fit text; narrow strip pills (< 65px) keep strip width and clip cleanly
+    let final_size = if size.x >= 65.0 {
+        Vec2::new(size.x.max(text_w + 14.0), size.y)
+    } else {
+        size
+    };
+    let (rect, resp) = ui.allocate_exact_size(final_size, Sense::click());
     let painter = ui.painter_at(rect);
 
     let bg = if active {
@@ -1341,11 +1354,6 @@ pub fn draw_pill_button(
     } else {
         Color32::from_rgb(55, 68, 88)
     };
-    let text_col = if active {
-        Color32::WHITE
-    } else {
-        Color32::from_rgb(185, 198, 215)
-    };
 
     painter.rect_filled(rect, CornerRadius::same(4), bg);
     painter.rect_stroke(
@@ -1354,11 +1362,11 @@ pub fn draw_pill_button(
         Stroke::new(1.0_f32, border),
         StrokeKind::Inside,
     );
-    painter.text(
+    painter.with_clip_rect(rect.shrink(1.5)).text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(10.5),
+        font,
         text_col,
     );
     resp

@@ -390,70 +390,66 @@ fn render_top_bar(
                 state.show_stream_deck_macros = !state.show_stream_deck_macros;
             }
 
-            // Right-aligned Console Mode Switcher + Lock (or wraps cleanly if narrow)
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
+            // Console Mode Switcher + Presets + Lock (flows cleanly in horizontal_wrapped without overlapping)
+            ui.separator();
+            ui.menu_button(
+                RichText::new("\u{f0de} Presets Canal")
+                    .size(11.0)
+                    .strong()
+                    .color(Color32::from_rgb(0, 220, 255)),
+                |ui| {
+                    let sel = state.selected_channel;
+                    ui.label(
+                        RichText::new(format!("Aplicar em: {}", state.channel_name(sel)))
+                            .strong()
+                            .size(11.5),
+                    );
+                    ui.label(
+                        RichText::new("Configura Ganho, HPF/LPF, Gate, Comp e EQ")
+                            .size(10.5),
+                    );
+                    ui.separator();
+                    for p in ChannelPreset::ALL {
+                        if ui.button(p.label()).clicked() {
+                            state.apply_channel_preset(sel, p);
+                            ui.close_menu();
+                        }
+                    }
+                },
+            )
+            .response
+            .on_hover_text("Aplica presets prontos (Voz, Baixo, Guitarra, Violão, Teclado, Bateria) no canal selecionado");
+
+            for vm in [ViewMode::Normal, ViewMode::Analog] {
+                let active = state.view_mode == vm && state.top_tab == TopNavTab::Mixer;
                 if draw_pill_button(
                     ui,
-                    "\u{f023} LOCK",
-                    false,
-                    Color32::from_rgb(231, 76, 60),
-                    Vec2::new(66.0, 22.0),
+                    vm.label(),
+                    active,
+                    Color32::from_rgb(142, 68, 173),
+                    Vec2::new(102.0, 22.0),
                 )
-                .on_hover_text("Travar Console: Bloqueia a tela com senha (padrão: 1234) para evitar toques acidentais (Atalho: F12)")
+                .on_hover_text("Alterna o modo visual da console (Normal / Analógico)")
                 .clicked()
                 {
-                    state.console_locked = true;
-                    state.lock_password_input.clear();
+                    state.view_mode = vm;
+                    state.top_tab = TopNavTab::Mixer;
                 }
+            }
 
-                ui.separator();
-
-                for vm in [ViewMode::Analog, ViewMode::Normal] {
-                    let active = state.view_mode == vm && state.top_tab == TopNavTab::Mixer;
-                    if draw_pill_button(
-                        ui,
-                        vm.label(),
-                        active,
-                        Color32::from_rgb(142, 68, 173),
-                        Vec2::new(102.0, 22.0),
-                    )
-                    .on_hover_text("Alterna o modo visual da console (Normal / Analógico)")
-                    .clicked()
-                    {
-                        state.view_mode = vm;
-                        state.top_tab = TopNavTab::Mixer;
-                    }
-                }
-
-                ui.menu_button(
-                    RichText::new("\u{f0de} Presets Canal")
-                        .size(11.0)
-                        .strong()
-                        .color(Color32::from_rgb(0, 220, 255)),
-                    |ui| {
-                        let sel = state.selected_channel;
-                        ui.label(
-                            RichText::new(format!("Aplicar em: {}", state.channel_name(sel)))
-                                .strong()
-                                .size(11.5),
-                        );
-                        ui.label(
-                            RichText::new("Configura Ganho, HPF/LPF, Gate, Comp e EQ")
-                                .size(10.5),
-                        );
-                        ui.separator();
-                        for p in ChannelPreset::ALL {
-                            if ui.button(p.label()).clicked() {
-                                state.apply_channel_preset(sel, p);
-                                ui.close_menu();
-                            }
-                        }
-                    },
-                )
-                .response
-                .on_hover_text("Aplica presets prontos (Voz, Baixo, Guitarra, Violão, Teclado, Bateria) no canal selecionado");
-            });
+            if draw_pill_button(
+                ui,
+                "\u{f023} LOCK",
+                false,
+                Color32::from_rgb(231, 76, 60),
+                Vec2::new(66.0, 22.0),
+            )
+            .on_hover_text("Travar Console: Bloqueia a tela com senha (padrão: 1234) para evitar toques acidentais (Atalho: F12)")
+            .clicked()
+            {
+                state.console_locked = true;
+                state.lock_password_input.clear();
+            }
         });
 
         // Dedicated Safety Alert Strip (only shown when Solo / L&R Mute / Desplugar / Automix is active — never overlaps ROW 1)
@@ -709,30 +705,29 @@ fn render_bottom_bar(ui: &mut Ui, state: &mut Axios24State) {
             state.set_signal_gen_enabled(!sig_on);
         }
 
-        // Right side: Phones level + Toast notification
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut ph_db = state.phones_level_db();
-            ui.add_sized(
-                [if compact { 82.0 } else { 105.0 }, 20.0],
-                egui::Slider::new(&mut ph_db, -80.0..=0.0)
-                    .text("\u{f025}")
-                    .suffix("dB"),
-            );
-            if (ph_db - state.phones_level_db()).abs() > 0.1 {
-                state.set_phones_level_db(ph_db);
-            }
+        // Phones level + Toast notification (wraps cleanly in horizontal_wrapped)
+        ui.separator();
+        let mut ph_db = state.phones_level_db();
+        ui.add_sized(
+            [if compact { 82.0 } else { 105.0 }, 20.0],
+            egui::Slider::new(&mut ph_db, -80.0..=0.0)
+                .text("\u{f025}")
+                .suffix("dB"),
+        );
+        if (ph_db - state.phones_level_db()).abs() > 0.1 {
+            state.set_phones_level_db(ph_db);
+        }
 
-            if let Some((msg, exp)) = &state.status_toast {
-                if state.sim_time < *exp {
-                    ui.label(
-                        RichText::new(format!("\u{f00c} {}", msg))
-                            .size(11.0)
-                            .strong()
-                            .color(Color32::from_rgb(46, 213, 115)),
-                    );
-                }
+        if let Some((msg, exp)) = &state.status_toast {
+            if state.sim_time < *exp {
+                ui.label(
+                    RichText::new(format!("\u{f00c} {}", msg))
+                        .size(11.0)
+                        .strong()
+                        .color(Color32::from_rgb(46, 213, 115)),
+                );
             }
-        });
+        }
     });
 }
 
@@ -1375,37 +1370,33 @@ fn render_mixer_workspace(ui: &mut Ui, state: &mut Axios24State) {
                 let dis_lr = state.disconnected_lr_channels();
                 let any_mg = (0..4).any(|mg| state.mute_group_active(mg));
                 if !dis_lr.is_empty() || any_mg {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let warn_lbl = if !dis_lr.is_empty() {
-                            format!("\u{f071} {} Canal(is) sem L/R (Corrigir)", dis_lr.len())
-                        } else {
-                            "\u{f071} Mute Group Ativo (Liberar)".to_string()
-                        };
-                        if draw_pill_button(
-                            ui,
-                            &warn_lbl,
-                            true,
-                            Color32::from_rgb(211, 84, 0),
-                            Vec2::new(178.0, 20.0),
-                        )
-                        .on_hover_text("Clique para ativar o envio L/R em todos os canais e liberar grupos de mute travados")
-                        .clicked()
-                        {
-                            state.fix_all_routing_to_main_lr();
-                        }
-                    });
+                    let warn_lbl = if !dis_lr.is_empty() {
+                        format!("\u{f071} {} Canal(is) sem L/R (Corrigir)", dis_lr.len())
+                    } else {
+                        "\u{f071} Mute Group Ativo (Liberar)".to_string()
+                    };
+                    if draw_pill_button(
+                        ui,
+                        &warn_lbl,
+                        true,
+                        Color32::from_rgb(211, 84, 0),
+                        Vec2::new(178.0, 20.0),
+                    )
+                    .on_hover_text("Clique para ativar o envio L/R em todos os canais e liberar grupos de mute travados")
+                    .clicked()
+                    {
+                        state.fix_all_routing_to_main_lr();
+                    }
                 } else if state.sends_on_fader != SendsOnFaderTarget::MainLR {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "\u{f071} MODO SENDS ON FADER: {} (ESC p/ L/R)",
-                                state.sends_on_fader.label()
-                            ))
-                            .size(10.5)
-                            .strong()
-                            .color(Color32::from_rgb(255, 205, 50)),
-                        );
-                    });
+                    ui.label(
+                        RichText::new(format!(
+                            "\u{f071} MODO SENDS ON FADER: {} (ESC p/ L/R)",
+                            state.sends_on_fader.label()
+                        ))
+                        .size(10.5)
+                        .strong()
+                        .color(Color32::from_rgb(255, 205, 50)),
+                    );
                 }
             });
         });
@@ -2764,31 +2755,29 @@ fn render_effects_page(ui: &mut Ui, state: &mut Axios24State) {
                     let algo_id = state.fx_algo_id(fx_idx);
                     let spec = FX_ALGORITHMS[(algo_id - 1) as usize];
 
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.heading(
                             RichText::new(format!("PROCESSADOR INTERNO FX{} — {}", fx_idx + 1, spec.name))
                                 .size(14.5)
                                 .strong()
                                 .color(Color32::from_rgb(233, 30, 99)),
                         );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Equalizar FX").clicked() {
-                                state.selected_channel = SelectedChannel::Fx(fx_idx);
-                                state.top_tab = TopNavTab::PeqGeq;
-                            }
-                            if draw_pill_button(
-                                ui,
-                                "Limpar Volta FX",
-                                false,
-                                Color32::from_rgb(46, 204, 113),
-                                Vec2::new(112.0, 22.0),
-                            )
-                            .on_hover_text("Aplica HPF 180 Hz + LPF 7.0 kHz na volta do efeito para evitar embolar graves ou chiar agudos")
-                            .clicked()
-                            {
-                                state.clean_fx_return_eq(fx_idx);
-                            }
-                        });
+                        if draw_pill_button(
+                            ui,
+                            "Limpar Volta FX",
+                            false,
+                            Color32::from_rgb(46, 204, 113),
+                            Vec2::new(112.0, 22.0),
+                        )
+                        .on_hover_text("Aplica HPF 180 Hz + LPF 7.0 kHz na volta do efeito para evitar embolar graves ou chiar agudos")
+                        .clicked()
+                        {
+                            state.clean_fx_return_eq(fx_idx);
+                        }
+                        if ui.button("Equalizar FX").clicked() {
+                            state.selected_channel = SelectedChannel::Fx(fx_idx);
+                            state.top_tab = TopNavTab::PeqGeq;
+                        }
                     });
                     ui.separator();
 
@@ -3467,27 +3456,25 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
 
     match state.settings_tab {
         SettingsSubTab::Scene => {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading("Gerenciador de Cenas (16 Cenas em preset.bin + Importar/Exportar .scn)");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("\u{f093} Exportar Cena (.scn)").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Axios24 Scene", &["scn"])
-                            .set_file_name(&format!("{}.scn", state.scene_names[state.active_scene_idx]))
-                            .save_file()
-                        {
-                            state.export_scn_file(&path);
-                        }
+                if ui.button("\u{f019} Importar Cena (.scn)").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Axios24 Scene", &["scn"])
+                        .pick_file()
+                    {
+                        state.import_scn_file(&path);
                     }
-                    if ui.button("\u{f019} Importar Cena (.scn)").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Axios24 Scene", &["scn"])
-                            .pick_file()
-                        {
-                            state.import_scn_file(&path);
-                        }
+                }
+                if ui.button("\u{f093} Exportar Cena (.scn)").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Axios24 Scene", &["scn"])
+                        .set_file_name(&format!("{}.scn", state.scene_names[state.active_scene_idx]))
+                        .save_file()
+                    {
+                        state.export_scn_file(&path);
                     }
-                });
+                }
             });
             ui.add_space(6.0);
 
