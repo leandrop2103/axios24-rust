@@ -4684,8 +4684,8 @@ fn render_connect_modal(ctx: &egui::Context, state: &mut Axios24State) {
             }
         });
 
-        // USB Serial + Enviar Mix Offline
-        ui.horizontal(|ui| {
+        // USB Serial + Ler/Enviar Cena
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("USB Serial (115200):").size(14.0));
             egui::ComboBox::from_id_salt("serial_port_combo")
                 .selected_text(RichText::new(&state.connect_serial_port).size(14.0))
@@ -4709,6 +4709,16 @@ fn render_connect_modal(ctx: &egui::Context, state: &mut Axios24State) {
                 });
                 state.demo_running = false;
                 state.show_connect_modal = false;
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("\u{f019} Ler Cena da Mesa").size(13.5))
+                        .min_size(Vec2::new(155.0, 28.0)),
+                )
+                .on_hover_text("Lê os faders, EQ, Gate, Compressor e roteamentos atualmente ativos na mesa para o app")
+                .clicked()
+            {
+                state.sync_from_hardware();
             }
             if ui
                 .add(

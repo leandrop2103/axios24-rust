@@ -1886,6 +1886,7 @@ impl Axios24State {
             }
 
             self.hw_link.send_frame(build_scene_op_frame((idx + 1) as u8, false));
+            self.hw_link.read_all_registers();
             let safe_cnt = self.recall_safe_channels.iter().filter(|&&s| s).count();
             if safe_cnt > 0 {
                 self.toast(format!(
@@ -2586,7 +2587,8 @@ impl Axios24State {
                 }
                 NetEvent::Connected(info) => {
                     got_hw_packet = true;
-                    self.toast(format!("Conectado: {}", info));
+                    self.hw_link.read_all_registers();
+                    self.toast(format!("Conectado: {} (lendo cena atual da mesa...)", info));
                 }
                 NetEvent::Error(err) => {
                     self.net_link_lost = true;
@@ -3010,7 +3012,17 @@ impl Axios24State {
             self.toast("Conecte-se via UDP, TCP ou Serial primeiro para sincronizar com a mesa física.");
         } else {
             self.hw_link.sync_all_registers(&self.regs);
-            self.toast("Todos os 3.413 registradores DSP foram enviados para a Axios 24!");
+            self.toast("Todos os registradores DSP foram enviados para a Axios 24!");
+        }
+    }
+
+    /// Reads the current live DSP state from the connected hardware mixer into the app
+    pub fn sync_from_hardware(&mut self) {
+        if matches!(self.hw_link.mode, crate::protocol::ConnectionMode::Demo) {
+            self.toast("Conecte-se via UDP, TCP ou Serial primeiro para ler a cena da mesa.");
+        } else {
+            self.hw_link.read_all_registers();
+            self.toast("Lendo cena atual da Axios 24...");
         }
     }
 

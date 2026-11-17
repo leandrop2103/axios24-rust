@@ -714,6 +714,24 @@ impl HardwareLink {
         }
     }
 
+    /// Requests all DSP registers from the connected mixer (opcode 0x06) so the app reflects the mixer's live scene
+    pub fn read_all_registers(&self) {
+        if matches!(self.mode, ConnectionMode::Demo) {
+            return;
+        }
+        let mut batch = Vec::with_capacity(32);
+        for idx in 0..NUM_REGS {
+            batch.push(self.firmware_layout.to_device(idx as u16));
+            if batch.len() == 32 {
+                self.send_frame(build_param_read_frame(&batch));
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.send_frame(build_param_read_frame(&batch));
+        }
+    }
+
     pub fn poll_events(&self) -> Vec<NetEvent> {
         let mut events = Vec::new();
         if let Some(rx) = &self.rx_in {
