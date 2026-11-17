@@ -220,9 +220,9 @@ fn render_top_bar(
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 5.0;
 
-        // ROW 1: Brand, Connection, Demo, Active Scene on Left | View Mode Switcher & Lock on Right
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+        // ROW 1: Brand, Connection, Demo, Active Scene, View Mode Switcher & Lock (wrapping, zero overlap)
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
 
             // Ferris Mixer Icon inside app
             if let Some(tex) = ferris_logo {
@@ -390,68 +390,7 @@ fn render_top_bar(
                 state.show_stream_deck_macros = !state.show_stream_deck_macros;
             }
 
-            // Safety Alert Badges in Top Bar (1-click fix for forgotten Solo / Main Mute / Desplugar)
-            if state.any_channel_soloed() {
-                if draw_pill_button(
-                    ui,
-                    "\u{f071} SOLO ATIVO",
-                    true,
-                    Color32::from_rgb(243, 156, 18),
-                    Vec2::new(92.0, 22.0),
-                )
-                .on_hover_text("Há canal(is) em SOLO! Clique para limpar todos os Solos")
-                .clicked()
-                {
-                    state.clear_all_solos();
-                }
-            }
-            if state.channel_muted(SelectedChannel::Output(8))
-                || state.channel_muted(SelectedChannel::Output(9))
-            {
-                if draw_pill_button(
-                    ui,
-                    "\u{f026} L/R MUTADO",
-                    true,
-                    Color32::from_rgb(220, 38, 38),
-                    Vec2::new(96.0, 22.0),
-                )
-                .on_hover_text("O Master MAIN L/R está mutado! Clique para desmutar L&R")
-                .clicked()
-                {
-                    state.set_channel_muted(SelectedChannel::Output(8), false);
-                    state.set_channel_muted(SelectedChannel::Output(9), false);
-                }
-            }
-            if state.all_safe_unplugged() {
-                if draw_pill_button(
-                    ui,
-                    "\u{f1e6} DESPLUGAR ON",
-                    true,
-                    Color32::from_rgb(211, 84, 0),
-                    Vec2::new(112.0, 22.0),
-                )
-                .on_hover_text("Modo Desplugar Todos ativo (CH1-24 em -120dB). Clique ou aperte Ctrl+U para restaurar")
-                .clicked()
-                {
-                    state.toggle_safe_unplug_all();
-                }
-            }
-            if state.automix_enabled {
-                if draw_pill_button(
-                    ui,
-                    "AUTOMIX",
-                    true,
-                    Color32::from_rgb(155, 89, 182),
-                    Vec2::new(72.0, 22.0),
-                )
-                .on_hover_text("Auto-Mixer (Dugan) ativo. Clique para desligar")
-                .clicked()
-                {
-                    state.automix_enabled = false;
-                }
-            }
-
-            // Right-aligned Console Mode Switcher + Lock
+            // Right-aligned Console Mode Switcher + Lock (or wraps cleanly if narrow)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 5.0;
                 if draw_pill_button(
@@ -516,6 +455,80 @@ fn render_top_bar(
                 .on_hover_text("Aplica presets prontos (Voz, Baixo, Guitarra, Violão, Teclado, Bateria) no canal selecionado");
             });
         });
+
+        // Dedicated Safety Alert Strip (only shown when Solo / L&R Mute / Desplugar / Automix is active — never overlaps ROW 1)
+        let any_solo = state.any_channel_soloed();
+        let lr_muted = state.channel_muted(SelectedChannel::Output(8))
+            || state.channel_muted(SelectedChannel::Output(9));
+        let all_unplugged = state.all_safe_unplugged();
+        if any_solo || lr_muted || all_unplugged || state.automix_enabled {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
+                ui.label(
+                    RichText::new("ALERTAS ATIVOS:")
+                        .size(10.5)
+                        .strong()
+                        .color(Color32::from_rgb(243, 156, 18)),
+                );
+                if any_solo {
+                    if draw_pill_button(
+                        ui,
+                        "\u{f071} SOLO ATIVO (Limpar)",
+                        true,
+                        Color32::from_rgb(243, 156, 18),
+                        Vec2::new(138.0, 20.0),
+                    )
+                    .on_hover_text("Há canal(is) em SOLO! Clique para limpar todos os Solos")
+                    .clicked()
+                    {
+                        state.clear_all_solos();
+                    }
+                }
+                if lr_muted {
+                    if draw_pill_button(
+                        ui,
+                        "\u{f026} MAIN L/R MUTADO (Desmutar)",
+                        true,
+                        Color32::from_rgb(220, 38, 38),
+                        Vec2::new(182.0, 20.0),
+                    )
+                    .on_hover_text("O Master MAIN L/R está mutado! Clique para desmutar L&R")
+                    .clicked()
+                    {
+                        state.set_channel_muted(SelectedChannel::Output(8), false);
+                        state.set_channel_muted(SelectedChannel::Output(9), false);
+                    }
+                }
+                if all_unplugged {
+                    if draw_pill_button(
+                        ui,
+                        "\u{f1e6} DESPLUGAR TODOS ON (Restaurar)",
+                        true,
+                        Color32::from_rgb(211, 84, 0),
+                        Vec2::new(205.0, 20.0),
+                    )
+                    .on_hover_text("Modo Desplugar Todos ativo (CH1-24 em -120dB). Clique ou aperte Ctrl+U para restaurar")
+                    .clicked()
+                    {
+                        state.toggle_safe_unplug_all();
+                    }
+                }
+                if state.automix_enabled {
+                    if draw_pill_button(
+                        ui,
+                        "AUTOMIX ON (Desligar)",
+                        true,
+                        Color32::from_rgb(155, 89, 182),
+                        Vec2::new(142.0, 20.0),
+                    )
+                    .on_hover_text("Auto-Mixer (Dugan) ativo. Clique para desligar")
+                    .clicked()
+                    {
+                        state.automix_enabled = false;
+                    }
+                }
+            });
+        }
 
         // ROW 2: 6 Full-Width Responsive Navigation Tabs (Zero Overlap)
         ui.horizontal(|ui| {
