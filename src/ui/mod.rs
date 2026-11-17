@@ -25,6 +25,12 @@ pub fn render_app(
         return;
     }
 
+    // Personal Monitor Locked Mode ("Meu Fone" — only controls chosen AUX)
+    if state.personal_monitor_locked {
+        render_personal_monitor_screen(ctx, state);
+        return;
+    }
+
     // Global Keyboard Shortcuts (Fine Fader 0.1dB/1dB, Mute, Solo, Unity 0dB, Search Ctrl+F, Layers F1..F7)
     handle_keyboard_shortcuts(ctx, state);
 
@@ -130,6 +136,57 @@ pub fn render_app(
                 state.set_output_stereo_linked(8, !lr_linked);
             }
             ui.add_space(3.0);
+            // Always-visible compact Bluetooth / DIGI control above MAIN L & R
+            {
+                let digi_sel = SelectedChannel::Input(24);
+                let mut digi_db = state.channel_fader_db(digi_sel);
+                let digi_muted = state.channel_muted(digi_sel);
+                Frame::NONE
+                    .fill(if state.dark_theme { Color32::from_rgb(16, 22, 34) } else { Color32::from_rgb(222, 230, 242) })
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(Margin::symmetric(5, 4))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0, 145, 215)))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("\u{f293} BT/DIGI")
+                                    .size(10.5)
+                                    .strong()
+                                    .color(Color32::from_rgb(0, 195, 245)),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if draw_pill_button(
+                                    ui,
+                                    if digi_muted { "MUT" } else { "ON" },
+                                    digi_muted,
+                                    Color32::from_rgb(231, 76, 60),
+                                    Vec2::new(34.0, 16.0),
+                                )
+                                .on_hover_text("Muta/Desmuta o retorno Bluetooth / DIGI (CH 25-26)")
+                                .clicked()
+                                {
+                                    state.set_channel_muted(digi_sel, !digi_muted);
+                                }
+                            });
+                        });
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut digi_db, -120.0..=10.0)
+                                    .show_value(false),
+                            )
+                            .on_hover_text("Volume do Bluetooth / DIGI (duplo clique no console p/ 0 dB)")
+                            .changed()
+                        {
+                            state.set_channel_fader_db(digi_sel, digi_db);
+                        }
+                        ui.label(
+                            RichText::new(format!("Fundo/BT: {}", format_fader_db(digi_db)))
+                                .size(10.0)
+                                .monospace(),
+                        );
+                    });
+                ui.add_space(3.0);
+            }
             let dock_h = ui.available_height().max(120.0);
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -331,6 +388,67 @@ fn render_top_bar(
             .clicked()
             {
                 state.show_stream_deck_macros = !state.show_stream_deck_macros;
+            }
+
+            // Safety Alert Badges in Top Bar (1-click fix for forgotten Solo / Main Mute / Desplugar)
+            if state.any_channel_soloed() {
+                if draw_pill_button(
+                    ui,
+                    "\u{f071} SOLO ATIVO",
+                    true,
+                    Color32::from_rgb(243, 156, 18),
+                    Vec2::new(92.0, 22.0),
+                )
+                .on_hover_text("Há canal(is) em SOLO! Clique para limpar todos os Solos")
+                .clicked()
+                {
+                    state.clear_all_solos();
+                }
+            }
+            if state.channel_muted(SelectedChannel::Output(8))
+                || state.channel_muted(SelectedChannel::Output(9))
+            {
+                if draw_pill_button(
+                    ui,
+                    "\u{f026} L/R MUTADO",
+                    true,
+                    Color32::from_rgb(220, 38, 38),
+                    Vec2::new(96.0, 22.0),
+                )
+                .on_hover_text("O Master MAIN L/R está mutado! Clique para desmutar L&R")
+                .clicked()
+                {
+                    state.set_channel_muted(SelectedChannel::Output(8), false);
+                    state.set_channel_muted(SelectedChannel::Output(9), false);
+                }
+            }
+            if state.all_safe_unplugged() {
+                if draw_pill_button(
+                    ui,
+                    "\u{f1e6} DESPLUGAR ON",
+                    true,
+                    Color32::from_rgb(211, 84, 0),
+                    Vec2::new(112.0, 22.0),
+                )
+                .on_hover_text("Modo Desplugar Todos ativo (CH1-24 em -120dB). Clique ou aperte Ctrl+U para restaurar")
+                .clicked()
+                {
+                    state.toggle_safe_unplug_all();
+                }
+            }
+            if state.automix_enabled {
+                if draw_pill_button(
+                    ui,
+                    "AUTOMIX",
+                    true,
+                    Color32::from_rgb(155, 89, 182),
+                    Vec2::new(72.0, 22.0),
+                )
+                .on_hover_text("Auto-Mixer (Dugan) ativo. Clique para desligar")
+                .clicked()
+                {
+                    state.automix_enabled = false;
+                }
             }
 
             // Right-aligned Console Mode Switcher + Lock
@@ -669,6 +787,9 @@ fn handle_keyboard_shortcuts(ctx: &egui::Context, state: &mut Axios24State) {
                 return;
             } else if i.key_pressed(egui::Key::Z) {
                 state.undo();
+                return;
+            } else if i.key_pressed(egui::Key::U) {
+                state.toggle_safe_unplug_all();
                 return;
             } else if i.modifiers.shift && i.key_pressed(egui::Key::S) {
                 state.clear_all_solos();
@@ -1009,6 +1130,35 @@ fn render_mixer_workspace(ui: &mut Ui, state: &mut Axios24State) {
                         state.show_soundcheck_wizard = !state.show_soundcheck_wizard;
                         state.soundcheck_step = 0;
                     }
+                    let (sel_grp, _) = sel.group_and_index();
+                    if sel_grp == 1 || sel_grp == 2 || sel_grp == 3 {
+                        let hpf_on = state.is_hpf_active(sel);
+                        if draw_pill_button(
+                            ui,
+                            if hpf_on { "HPF ON" } else { "HPF 100Hz" },
+                            hpf_on,
+                            Color32::from_rgb(46, 204, 113),
+                            Vec2::new(72.0, 20.0),
+                        )
+                        .on_hover_text("Corte de graves rápido (HPF 100 Hz 18dB/oct): limpa voz, violão e instrumentos sem grave")
+                        .clicked()
+                        {
+                            state.toggle_quick_hpf_100hz(sel);
+                        }
+                        let is_b = state.is_ab_b_active(sel);
+                        if draw_pill_button(
+                            ui,
+                            if is_b { "A/B: B" } else { "A/B: A" },
+                            is_b,
+                            Color32::from_rgb(243, 156, 18),
+                            Vec2::new(56.0, 20.0),
+                        )
+                        .on_hover_text("Alterna instantaneamente entre ajuste A e B (EQ + Gate + Compressor) para comparar com ouvido limpo")
+                        .clicked()
+                        {
+                            state.toggle_ab_compare(sel);
+                        }
+                    }
                     if let (1, ch) = sel.group_and_index() {
                         if ch < 24 {
                             let am = state.automix_channels[ch];
@@ -1040,6 +1190,43 @@ fn render_mixer_workspace(ui: &mut Ui, state: &mut Axios24State) {
                         .clicked()
                         {
                             state.clear_all_clips();
+                        }
+                    }
+                    let all_unplugged = state.all_safe_unplugged();
+                    if draw_pill_button(
+                        ui,
+                        if all_unplugged {
+                            "\u{f1e6} Desplugar ON (Ctrl+U)"
+                        } else {
+                            "\u{f1e6} Desplugar Todos (Ctrl+U)"
+                        },
+                        all_unplugged,
+                        Color32::from_rgb(230, 126, 34),
+                        Vec2::new(168.0, 20.0),
+                    )
+                    .on_hover_text("Ativa/Desativa o Modo Desplugar em todos os canais (CH1-24) de uma vez para desligar o som sem estalos no fim do culto (Atalho: Ctrl+U)")
+                    .clicked()
+                    {
+                        state.toggle_safe_unplug_all();
+                    }
+                    if state.multitrack.total_samples.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        let mt_play = state.multitrack.playing.load(std::sync::atomic::Ordering::Relaxed);
+                        if draw_pill_button(
+                            ui,
+                            if mt_play { "\u{f04c} MTK" } else { "\u{f04b} MTK" },
+                            mt_play,
+                            Color32::from_rgb(46, 204, 113),
+                            Vec2::new(58.0, 20.0),
+                        )
+                        .on_hover_text("Play/Pause do Multitrack Offline carregado (PLAYER & REC)")
+                        .clicked()
+                        {
+                            if mt_play {
+                                state.multitrack.pause();
+                            } else {
+                                state.sync_multitrack_dsp();
+                                state.multitrack.play();
+                            }
                         }
                     }
                 });
@@ -1514,6 +1701,69 @@ fn render_edit_channel_page(ui: &mut Ui, state: &mut Axios24State) {
                                         state.set_input_preamp_gain_db(ch, gain);
                                     }
                                 });
+                                // Gain Staging Sweet Spot Bar (-18 dBFS target)
+                                {
+                                    let (gs_status, gs_col) = if meter_db < -30.0 {
+                                        ("Sinal Fraco (+Ganho)", Color32::from_rgb(120, 155, 190))
+                                    } else if meter_db <= -12.0 {
+                                        ("Sweet Spot Ideal (-18 dBFS)", Color32::from_rgb(46, 204, 113))
+                                    } else if meter_db <= -3.0 {
+                                        ("Quente (-Ganho)", Color32::from_rgb(243, 156, 18))
+                                    } else {
+                                        ("Risco de Clip!", Color32::from_rgb(231, 76, 60))
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("Estrutura: {:.1} dB ({})", meter_db, gs_status))
+                                                .size(10.5)
+                                                .strong()
+                                                .color(gs_col),
+                                        );
+                                    });
+                                    let bar_w = ui.available_width().max(120.0);
+                                    let (rect, _) = ui.allocate_exact_size(Vec2::new(bar_w, 10.0), egui::Sense::hover());
+                                    let p = ui.painter_at(rect);
+                                    p.rect_filled(rect, 3.0, Color32::from_rgb(20, 26, 38));
+                                    let db_to_x = |db: f32| {
+                                        let t = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+                                        rect.left() + t * rect.width()
+                                    };
+                                    // Highlight -20 .. -12 dBFS green target zone
+                                    let zone = egui::Rect::from_min_max(
+                                        egui::pos2(db_to_x(-20.0), rect.top()),
+                                        egui::pos2(db_to_x(-12.0), rect.bottom()),
+                                    );
+                                    p.rect_filled(zone, 2.0, Color32::from_rgba_unmultiplied(46, 204, 113, 60));
+                                    let fill_x = db_to_x(meter_db);
+                                    let fill = egui::Rect::from_min_max(rect.min, egui::pos2(fill_x, rect.bottom()));
+                                    p.rect_filled(fill, 2.0, gs_col);
+                                    let target_x = db_to_x(-18.0);
+                                    p.line_segment(
+                                        [egui::pos2(target_x, rect.top()), egui::pos2(target_x, rect.bottom())],
+                                        Stroke::new(1.5_f32, Color32::WHITE),
+                                    );
+                                }
+                                // Delay alignment in ms <-> meters (0.343 m/ms)
+                                {
+                                    let mut dly = state.input_delay_ms(ch);
+                                    let mut meters = dly * 0.343;
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Delay:").size(11.0).strong());
+                                        if ui
+                                            .add(egui::DragValue::new(&mut dly).range(0.0..=40.0).speed(0.1).suffix(" ms"))
+                                            .changed()
+                                        {
+                                            state.set_input_delay_ms(ch, dly);
+                                        }
+                                        ui.label("=");
+                                        if ui
+                                            .add(egui::DragValue::new(&mut meters).range(0.0..=13.72).speed(0.05).suffix(" m"))
+                                            .changed()
+                                        {
+                                            state.set_input_delay_ms(ch, (meters / 0.343).clamp(0.0, 40.0));
+                                        }
+                                    });
+                                }
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
                                     let p48 = state.input_phantom_48v(ch);
@@ -1535,6 +1785,41 @@ fn render_edit_channel_page(ui: &mut Ui, state: &mut Axios24State) {
                                     }
                                 });
                             }
+                        });
+                    ui.add_space(6.0);
+                } else if group == 3 {
+                    Frame::NONE
+                        .fill(Color32::from_rgb(12, 17, 25))
+                        .corner_radius(CornerRadius::same(5))
+                        .inner_margin(Margin::same(8))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(52, 68, 92)))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("ALINHAMENTO DE DELAY DA SAÍDA (PA / TORRE / SUB)")
+                                    .size(11.5)
+                                    .strong()
+                                    .color(Color32::from_rgb(0, 200, 245)),
+                            );
+                            let mut dly = state.output_delay_ms(ch);
+                            let mut meters = dly * 0.343;
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(egui::Slider::new(&mut dly, 0.0..=40.0).text("ms"))
+                                    .changed()
+                                {
+                                    state.set_output_delay_ms(ch, dly);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Distância Física:");
+                                if ui
+                                    .add(egui::DragValue::new(&mut meters).range(0.0..=13.72).speed(0.05).suffix(" m"))
+                                    .changed()
+                                {
+                                    state.set_output_delay_ms(ch, (meters / 0.343).clamp(0.0, 40.0));
+                                }
+                                ui.label(RichText::new("(1 ms ≈ 0.343 m)").size(10.5).color(Color32::from_rgb(140, 160, 185)));
+                            });
                         });
                     ui.add_space(6.0);
                 }
@@ -1947,6 +2232,27 @@ fn render_peq_geq_page(ui: &mut Ui, state: &mut Axios24State) {
         .clicked()
         {
             state.set_eq_enabled(eq_group, eq_ch, !eq_on);
+        }
+
+        let is_b = state.is_ab_b_active(sel);
+        if draw_pill_button(
+            ui,
+            if is_b { "A/B: B" } else { "A/B: A" },
+            is_b,
+            Color32::from_rgb(243, 156, 18),
+            Vec2::new(66.0, 24.0),
+        )
+        .on_hover_text("Alterna entre ajuste A e B (EQ + Gate + Compressor) para comparar antes/depois")
+        .clicked()
+        {
+            state.toggle_ab_compare(sel);
+        }
+        if ui
+            .small_button("Copiar A→B")
+            .on_hover_text("Salva o ajuste atual nos dois slots A e B para iniciar nova comparação")
+            .clicked()
+        {
+            state.copy_a_to_b(sel);
         }
 
         let rta = state.show_rta_on_eq;
@@ -2457,6 +2763,18 @@ fn render_effects_page(ui: &mut Ui, state: &mut Axios24State) {
                                 state.selected_channel = SelectedChannel::Fx(fx_idx);
                                 state.top_tab = TopNavTab::PeqGeq;
                             }
+                            if draw_pill_button(
+                                ui,
+                                "Limpar Volta FX",
+                                false,
+                                Color32::from_rgb(46, 204, 113),
+                                Vec2::new(112.0, 22.0),
+                            )
+                            .on_hover_text("Aplica HPF 180 Hz + LPF 7.0 kHz na volta do efeito para evitar embolar graves ou chiar agudos")
+                            .clicked()
+                            {
+                                state.clean_fx_return_eq(fx_idx);
+                            }
                         });
                     });
                     ui.separator();
@@ -2576,12 +2894,20 @@ fn render_effects_page(ui: &mut Ui, state: &mut Axios24State) {
                     });
 
                     ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("MANDADAS FX -> AUX 1-8:")
-                            .size(11.5)
-                            .strong()
-                            .color(Color32::from_rgb(165, 185, 205)),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("MANDADAS FX -> AUX 1-8:")
+                                .size(11.5)
+                                .strong()
+                                .color(Color32::from_rgb(165, 185, 205)),
+                        );
+                        if ui.small_button("Zerar FX->AUX").clicked() {
+                            for aux in 0..8 {
+                                state.set_fx_aux_send_db(fx_idx, aux, -120.0);
+                            }
+                            state.toast(format!("Mandadas FX{} -> AUX 1-8 zeradas.", fx_idx + 1));
+                        }
+                    });
                     for aux in 0..8 {
                         ui.horizontal(|ui| {
                             let mut s_db = state.fx_aux_send_db(fx_idx, aux);
@@ -2640,7 +2966,7 @@ fn render_media_record_page(ui: &mut Ui, state: &mut Axios24State) {
                         )
                         .clicked()
                         {
-                            state.media.source = src;
+                            state.set_media_source(src);
                         }
                     }
                     if draw_pill_button(
@@ -2849,6 +3175,169 @@ fn render_media_record_page(ui: &mut Ui, state: &mut Axios24State) {
                     .changed()
                 {
                     state.set_channel_fader_db(digi_sel, f_db);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let digi_muted = state.channel_muted(digi_sel);
+                    if draw_pill_button(
+                        ui,
+                        if digi_muted { "DIGI MUTADO (Desmutar)" } else { "DIGI ABERTO" },
+                        !digi_muted,
+                        Color32::from_rgb(46, 204, 113),
+                        Vec2::new(150.0, 22.0),
+                    )
+                    .clicked()
+                    {
+                        state.set_channel_muted(digi_sel, !digi_muted);
+                    }
+                    if draw_pill_button(
+                        ui,
+                        "\u{f293} Ativar Bluetooth + Liberar Playback (0 dB)",
+                        state.media.source == MediaSource::Bluetooth && !digi_muted,
+                        Color32::from_rgb(0, 145, 215),
+                        Vec2::new(265.0, 22.0),
+                    )
+                    .on_hover_text("Alterna a mesa para Bluetooth, ativa L/R no canal DIGI, desmuta e coloca em 0.0 dB para playbacks/fundos")
+                    .clicked()
+                    {
+                        state.set_media_source(MediaSource::Bluetooth);
+                        state.set_input_to_main_lr(24, true);
+                        state.set_channel_muted(digi_sel, false);
+                        state.set_channel_fader_db(digi_sel, 0.0);
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.heading(
+                    RichText::new("\u{f001} MULTITRACK OFFLINE (VIRTUAL SOUNDCHECK — MODO DEMO)")
+                        .size(14.0)
+                        .color(Color32::from_rgb(46, 204, 113)),
+                );
+                ui.label(
+                    RichText::new("Carregue vários arquivos .WAV de uma vez (ou uma pasta inteira) para mixar com EQ, Gate, Compressor e Faders nos fones do PC.")
+                        .size(11.5)
+                        .color(Color32::from_rgb(165, 185, 205)),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("\u{f07c} Abrir Arquivos .WAV (Vários)")
+                        .on_hover_text("Selecione vários arquivos .wav de uma vez (Ctrl+A) ou um WAV multicanal")
+                        .clicked()
+                    {
+                        if let Some(files) = rfd::FileDialog::new()
+                            .add_filter("Áudio WAV", &["wav", "WAV"])
+                            .pick_files()
+                        {
+                            state.load_multitrack_files(&files);
+                        }
+                    }
+                    if ui
+                        .button("\u{f07b} Abrir Pasta Multitrack")
+                        .on_hover_text("Carrega automaticamente todos os arquivos .wav de uma pasta em CH1..CH24")
+                        .clicked()
+                    {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                                let mut wavs: Vec<std::path::PathBuf> = entries
+                                    .flatten()
+                                    .map(|e| e.path())
+                                    .filter(|p| {
+                                        p.extension()
+                                            .and_then(|e| e.to_str())
+                                            .map(|e| e.eq_ignore_ascii_case("wav"))
+                                            .unwrap_or(false)
+                                    })
+                                    .collect();
+                                wavs.sort();
+                                state.load_multitrack_files(&wavs);
+                            }
+                        }
+                    }
+                    ui.checkbox(&mut state.multitrack_auto_name, "Auto-nomear canais");
+                });
+
+                let mt_playing = state.multitrack.playing.load(std::sync::atomic::Ordering::Relaxed);
+                let tot = state.multitrack.total_samples.load(std::sync::atomic::Ordering::Relaxed);
+                let cur = state.multitrack.cursor_samples.load(std::sync::atomic::Ordering::Relaxed);
+                ui.horizontal(|ui| {
+                    if draw_pill_button(
+                        ui,
+                        if mt_playing { "\u{f04c} PAUSE" } else { "\u{f04b} PLAY" },
+                        mt_playing,
+                        Color32::from_rgb(46, 204, 113),
+                        Vec2::new(82.0, 24.0),
+                    )
+                    .clicked()
+                    {
+                        if mt_playing {
+                            state.multitrack.pause();
+                        } else {
+                            state.sync_multitrack_dsp();
+                            state.multitrack.play();
+                        }
+                    }
+                    if ui.button("\u{f04d} Stop").clicked() {
+                        state.multitrack.stop();
+                    }
+                    let mut looping = state.multitrack.looping.load(std::sync::atomic::Ordering::Relaxed);
+                    if ui.checkbox(&mut looping, "Loop").changed() {
+                        state.multitrack.looping.store(looping, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if ui.button("Limpar").clicked() {
+                        state.multitrack.clear();
+                    }
+                    let cur_s = cur / crate::multitrack::MT_SAMPLE_RATE;
+                    let tot_s = tot / crate::multitrack::MT_SAMPLE_RATE;
+                    ui.label(
+                        RichText::new(format!("{:02}:{:02} / {:02}:{:02}", cur_s / 60, cur_s % 60, tot_s / 60, tot_s % 60))
+                            .monospace()
+                            .size(12.0),
+                    );
+                });
+                if tot > 0 {
+                    let mut pos_f = cur as f32 / tot as f32;
+                    if ui
+                        .add(egui::Slider::new(&mut pos_f, 0.0..=1.0).show_value(false))
+                        .changed()
+                    {
+                        let target = ((pos_f * tot as f32) as usize).min(tot.saturating_sub(1));
+                        state.multitrack.cursor_samples.store(target, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                ui.label(RichText::new(&state.multitrack.status).size(11.0).color(Color32::from_rgb(130, 205, 240)));
+
+                let mut tracks_snapshot = state.multitrack.tracks.lock().unwrap().clone();
+                let mut tracks_dirty = false;
+                ScrollArea::vertical()
+                    .id_salt("mtk_tracks_scroll")
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        for (idx, tr) in tracks_snapshot.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("{:02}. {:<12}", idx + 1, tr.name)).monospace().size(11.5));
+                                egui::ComboBox::from_id_salt(("mtk_ch", idx))
+                                    .selected_text(format!("CH{}", tr.channel_idx + 1))
+                                    .width(64.0)
+                                    .show_ui(ui, |ui| {
+                                        for c in 0..24 {
+                                            if ui.selectable_value(&mut tr.channel_idx, c, format!("CH{}", c + 1)).changed() {
+                                                tracks_dirty = true;
+                                            }
+                                        }
+                                    });
+                                if draw_pill_button(ui, "M", tr.muted, Color32::from_rgb(231, 76, 60), Vec2::new(24.0, 18.0)).clicked() {
+                                    tr.muted = !tr.muted;
+                                    tracks_dirty = true;
+                                }
+                                if draw_pill_button(ui, "S", tr.solo, Color32::from_rgb(241, 196, 15), Vec2::new(24.0, 18.0)).clicked() {
+                                    tr.solo = !tr.solo;
+                                    tracks_dirty = true;
+                                }
+                            });
+                        }
+                    });
+                if tracks_dirty {
+                    *state.multitrack.tracks.lock().unwrap() = tracks_snapshot;
                 }
             });
     });
@@ -3336,6 +3825,19 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
                                 }
                             }
                         });
+                        ui.add_space(10.0);
+                        if draw_pill_button(
+                            ui,
+                            &format!("\u{f023} Travar Tela \"Meu Fone\" (Só AUX {})", state.more_me_aux + 1),
+                            false,
+                            Color32::from_rgb(230, 126, 34),
+                            Vec2::new(270.0, 28.0),
+                        )
+                        .on_hover_text("Bloqueia toda a mesa e exibe apenas os faders deste AUX para o músico ajustar o próprio fone com segurança (desbloqueia com senha)")
+                        .clicked()
+                        {
+                            state.personal_monitor_locked = true;
+                        }
                     });
 
                 // Right: Matrix Mix (Live Stream / Overflow Room)
@@ -3670,6 +4172,7 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
                         ("Ctrl + C / Ctrl + V", "Copiar / Colar configurações do canal selecionado"),
                         ("Ctrl + Z", "Desfazer última troca de cena, preset ou colagem"),
                         ("Ctrl + D", "Ativar / Desativar DIM -20 dB no Master L/R"),
+                        ("Ctrl + U", "Ativar / Desativar Desplugar em TODOS os canais (CH1-24)"),
                         ("Ctrl + Shift + S", "Limpar todos os Solos ativos (CLR SOLO)"),
                     ],
                 ),
@@ -4276,6 +4779,92 @@ fn render_lock_screen(ctx: &egui::Context, state: &mut Axios24State) {
                         state.toast("Senha incorreta!");
                     }
                 }
+            });
+        });
+}
+
+fn render_personal_monitor_screen(ctx: &egui::Context, state: &mut Axios24State) {
+    let aux = state.more_me_aux.min(7);
+    egui::CentralPanel::default()
+        .frame(Frame::NONE.fill(Color32::from_rgb(10, 15, 24)))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(
+                    RichText::new(format!(
+                        "\u{f025} MODO MONITOR PESSOAL (TRAVADO) — AUX {}",
+                        aux + 1
+                    ))
+                    .size(18.0)
+                    .strong()
+                    .color(Color32::from_rgb(26, 218, 176)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("\u{f09c} Sair do Modo Fone").clicked() {
+                        if state.lock_password_input == state.stored_password
+                            || state.lock_password_input == "1234"
+                        {
+                            state.personal_monitor_locked = false;
+                            state.lock_password_input.clear();
+                        } else {
+                            state.toast("Digite a senha da console (padrão 1234) para sair!");
+                        }
+                    }
+                    ui.add_sized(
+                        [130.0, 24.0],
+                        egui::TextEdit::singleline(&mut state.lock_password_input)
+                            .password(true)
+                            .hint_text("Senha (1234)"),
+                    );
+                });
+            });
+            ui.label(
+                RichText::new("Modo seguro para músicos/operador de monitor: apenas os volumes enviados para este AUX podem ser ajustados.")
+                    .size(12.0)
+                    .color(Color32::from_rgb(150, 170, 195)),
+            );
+            ui.separator();
+
+            ScrollArea::vertical().id_salt("personal_mon_scroll").show(ui, |ui| {
+                ui.columns(2, |cols| {
+                    for ch in 0..25 {
+                        let c = &mut cols[if ch < 13 { 0 } else { 1 }];
+                        let sel = SelectedChannel::Input(ch);
+                        let mut db = state.input_aux_send_db(ch, aux);
+                        let lbl = format_fader_db(db);
+                        c.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{:<14}", state.channel_name(sel)))
+                                    .monospace()
+                                    .strong(),
+                            );
+                            if ui
+                                .add(egui::Slider::new(&mut db, -120.0..=10.0).text(lbl))
+                                .changed()
+                            {
+                                state.set_input_aux_send_db(ch, aux, db);
+                            }
+                        });
+                    }
+                    for fx in 0..2 {
+                        let c = &mut cols[1];
+                        let mut db = state.fx_aux_send_db(fx, aux);
+                        let lbl = format_fader_db(db);
+                        c.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{:<14}", format!("FX {}", fx + 1)))
+                                    .monospace()
+                                    .strong()
+                                    .color(Color32::from_rgb(233, 30, 99)),
+                            );
+                            if ui
+                                .add(egui::Slider::new(&mut db, -120.0..=0.0).text(lbl))
+                                .changed()
+                            {
+                                state.set_fx_aux_send_db(fx, aux, db);
+                            }
+                        });
+                    }
+                });
             });
         });
 }

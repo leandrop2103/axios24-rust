@@ -43,6 +43,8 @@ pub struct MidiControllerEngine {
     rx: Option<Receiver<MidiMsg>>,
     #[cfg(windows)]
     handle: usize,
+    #[cfg(target_os = "linux")]
+    linux_conn: Option<midir::MidiInputConnection<()>>,
 }
 
 impl Default for MidiControllerEngine {
@@ -59,6 +61,8 @@ impl Default for MidiControllerEngine {
             rx: None,
             #[cfg(windows)]
             handle: 0,
+            #[cfg(target_os = "linux")]
+            linux_conn: None,
         }
     }
 }
@@ -139,7 +143,19 @@ pub fn list_midi_input_devices() -> Vec<String> {
         }
         list
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(midi_in) = midir::MidiInput::new("axios24") {
+            return midi_in
+                .ports()
+                .iter()
+                .enumerate()
+                .map(|(i, p)| midi_in.port_name(p).unwrap_or_else(|_| format!("MIDI {}", i + 1)))
+                .collect();
+        }
+        Vec::new()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         Vec::new()
     }
@@ -182,10 +198,41 @@ impl MidiControllerEngine {
             self.selected_idx = idx;
             Ok(name)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            let midi_in = midir::MidiInput::new("axios24")
+                .map_err(|e| format!("Erro MIDI ALSA: {}", e))?;
+            let ports = midi_in.ports();
+            let Some(port) = ports.get(idx) else {
+                return Err("Porta MIDI não encontrada.".to_string());
+            };
+            let (tx, rx) = mpsc::channel();
+            let conn = midi_in
+                .connect(
+                    port,
+                    "axios24-in",
+                    move |_stamp, msg, _| {
+                        if !msg.is_empty() {
+                            let _ = tx.send(MidiMsg {
+                                status: msg[0],
+                                data1: *msg.get(1).unwrap_or(&0),
+                                data2: *msg.get(2).unwrap_or(&0),
+                            });
+                        }
+                    },
+                    (),
+                )
+                .map_err(|e| format!("Erro ao abrir porta MIDI '{}': {}", name, e))?;
+            self.linux_conn = Some(conn);
+            self.rx = Some(rx);
+            self.connected_name = Some(name.clone());
+            self.selected_idx = idx;
+            Ok(name)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = idx;
-            Err("MIDI USB nativo disponível no Windows (WinMM).".to_string())
+            Err("MIDI USB nativo disponível no Windows (WinMM) e Linux (ALSA).".to_string())
         }
     }
 
@@ -197,6 +244,10 @@ impl MidiControllerEngine {
                 win_midi::midiInClose(self.handle);
                 self.handle = 0;
             }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_conn = None;
         }
         self.rx = None;
         self.connected_name = None;

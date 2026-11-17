@@ -1007,7 +1007,8 @@ pub fn draw_rotary_knob(
     if rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll.abs() > 0.1 {
-            let step = (max - min) * 0.015 * scroll.signum();
+            let mult = if ui.input(|i| i.modifiers.shift) { 0.003 } else { 0.015 };
+            let step = (max - min) * mult * scroll.signum();
             *val = (*val + step).clamp(min, max);
             changed = true;
         }
@@ -1149,8 +1150,13 @@ pub fn draw_console_fader_and_meter(
     if rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll.abs() > 0.1 {
-            let norm = (db_to_fader_norm(*db, max_db) + scroll.signum() * 0.015).clamp(0.0, 1.0);
-            *db = (fader_norm_to_db(norm, max_db) * 10.0).round() / 10.0;
+            let shift = ui.input(|i| i.modifiers.shift);
+            if shift {
+                *db = ((*db + scroll.signum() * 0.1).clamp(-120.0, max_db) * 10.0).round() / 10.0;
+            } else {
+                let norm = (db_to_fader_norm(*db, max_db) + scroll.signum() * 0.012).clamp(0.0, 1.0);
+                *db = (fader_norm_to_db(norm, max_db) * 10.0).round() / 10.0;
+            }
             changed = true;
         }
     }
@@ -2032,15 +2038,24 @@ pub fn draw_channel_strip(
         StrokeKind::Inside,
     );
     let bottom_txt = if let Some(lnk) = state.channel_link_badge(sel) {
-        format!("\u{f0c1} {} {}", badge_lbl, lnk)
+        if lnk == "LNK" {
+            format!("\u{f0c1} {}", badge_lbl)
+        } else {
+            format!("\u{f0c1}{} {}", badge_lbl, lnk)
+        }
     } else {
         badge_lbl.clone()
     };
-    painter.text(
+    let bottom_font = if bottom_txt.chars().count() > 8 {
+        FontId::proportional(9.0)
+    } else {
+        FontId::proportional(10.0)
+    };
+    painter.with_clip_rect(scribble_rect.shrink(2.0)).text(
         scribble_rect.center(),
         Align2::CENTER_CENTER,
         &bottom_txt,
-        FontId::proportional(10.0),
+        bottom_font,
         if text_is_light { Color32::WHITE } else { Color32::from_rgb(15, 22, 34) },
     );
     let scribble_resp = ui.interact(

@@ -368,9 +368,83 @@ pub fn list_audio_input_devices() -> Vec<(u32, String)> {
     {
         winmm_capture::enumerate_devices()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_capture::enumerate_devices()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_capture {
+    use super::{analyze_samples_to_rta, RtaSnapshot, FFT_SIZE};
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    pub fn enumerate_devices() -> Vec<(u32, String)> {
+        let host = cpal::default_host();
+        let Ok(devs) = host.input_devices() else {
+            return Vec::new();
+        };
+        devs.enumerate()
+            .map(|(i, d)| (i as u32, d.name().unwrap_or_else(|_| format!("Input {}", i + 1))))
+            .collect()
+    }
+
+    pub fn run_capture_loop(
+        device_id: u32,
+        stop_flag: Arc<Mutex<bool>>,
+        shared_snap: Arc<Mutex<RtaSnapshot>>,
+    ) {
+        let host = cpal::default_host();
+        let dev = host
+            .input_devices()
+            .ok()
+            .and_then(|mut ds| ds.nth(device_id as usize))
+            .or_else(|| host.default_input_device());
+        let Some(device) = dev else {
+            return;
+        };
+        let Ok(cfg) = device.default_input_config() else {
+            return;
+        };
+        let sr = cfg.sample_rate().0;
+        let ch = cfg.channels().max(1) as usize;
+        let ring = Arc::new(Mutex::new(Vec::<f32>::with_capacity(FFT_SIZE * 2)));
+        let ring_cb = Arc::clone(&ring);
+        let snap_cb = Arc::clone(&shared_snap);
+
+        let stream = device.build_input_stream(
+            &cfg.into(),
+            move |data: &[f32], _| {
+                if let Ok(mut buf) = ring_cb.lock() {
+                    for frame in data.chunks(ch) {
+                        buf.push(frame[0]);
+                    }
+                    if buf.len() >= FFT_SIZE {
+                        let start = buf.len() - FFT_SIZE;
+                        let snap = analyze_samples_to_rta(&buf[start..], sr);
+                        if let Ok(mut g) = snap_cb.lock() {
+                            *g = snap;
+                        }
+                        buf.drain(..start);
+                    }
+                }
+            },
+            |_| {},
+            None,
+        );
+        if let Ok(stream) = stream {
+            let _ = stream.play();
+            while !*stop_flag.lock().unwrap() {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -420,6 +494,10 @@ impl LiveAudioRtaEngine {
         #[cfg(target_os = "windows")]
         thread::spawn(move || {
             winmm_capture::run_capture_loop(device_id, stop_clone, snap_clone);
+        });
+        #[cfg(target_os = "linux")]
+        thread::spawn(move || {
+            linux_capture::run_capture_loop(device_id, stop_clone, snap_clone);
         });
     }
 

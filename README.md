@@ -54,18 +54,18 @@ Instale o **Rust** via [rustup.rs](https://rustup.rs/).
    sudo apt update
    sudo apt install -y build-essential pkg-config libudev-dev libgtk-3-dev \
      libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-     libxkbcommon-dev libssl-dev libgl1-mesa-dev curl
+     libxkbcommon-dev libssl-dev libgl1-mesa-dev libasound2-dev curl
    ```
 
    **Fedora:**
    ```bash
    sudo dnf install -y gcc gcc-c++ pkgconfig systemd-devel gtk3-devel \
-     libxcb-devel libxkbcommon-devel mesa-libGL-devel curl
+     libxcb-devel libxkbcommon-devel mesa-libGL-devel alsa-lib-devel curl
    ```
 
    **Arch Linux:**
    ```bash
-   sudo pacman -S --needed base-devel pkgconf systemd gtk3 libxcb libxkbcommon mesa curl
+   sudo pacman -S --needed base-devel pkgconf systemd gtk3 libxcb libxkbcommon mesa alsa-lib curl
    ```
 
 2. Clone e compile:
@@ -80,7 +80,7 @@ Instale o **Rust** via [rustup.rs](https://rustup.rs/).
    ./target/release/axios24
    ```
 
-*(Nota: No Linux, a captura de áudio RTA via `WinMM` é desativada automaticamente, mantendo o modo Demo e todos os gráficos de EQ/PEQ/GEQ/Dinâmica funcionando normalmente.)*
+*(No Linux, o áudio do Multitrack, o RTA FFT e o MIDI USB funcionam nativamente via ALSA / PipeWire através de `cpal` e `midir`.)*
 
 ---
 

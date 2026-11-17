@@ -201,6 +201,19 @@ pub fn build_kv_frame(kv_text: &str, is_set: bool) -> Vec<u8> {
     build_frame(cmd, kv_text.as_bytes())
 }
 
+/// Builds a Digital Media / Bluetooth source switch frame (opcode 0x72, from AX24E.25.11.01.001)
+/// 0 = USB Music/Player, 1 = Bluetooth, 2 = Optical, 3 = Coaxial, 4 = USB Audio
+pub fn build_media_source_frame(source_id: u8) -> Vec<u8> {
+    let payload: [u8; 3] = match source_id {
+        0 => [0x00, 0x00, 0xA8], // USB Music / Player
+        1 => [0x00, 0x00, 0xC7], // Bluetooth
+        2 => [0x01, 0x00, 0xC3], // Optical
+        3 => [0x02, 0x00, 0xC3], // Coaxial
+        _ => [0x00, 0x00, 0xB5], // USB Audio
+    };
+    build_frame(0x72, &payload)
+}
+
 /// Encodes a single 0x3000-byte scene block with registers and CRC-16 at 0x2FFE (fcn.0045ed90)
 pub fn encode_scene_block(regs: &[u16; NUM_REGS]) -> Vec<u8> {
     let mut block = vec![0u8; SCENE_BLOCK_SIZE];

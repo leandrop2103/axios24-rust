@@ -5,6 +5,7 @@ pub mod default_scene;
 pub mod dsp;
 pub mod midi;
 pub mod model;
+pub mod multitrack;
 pub mod protocol;
 pub mod ui;
 pub mod updater;
@@ -252,6 +253,11 @@ mod tests {
         assert_eq!(demo_start.len(), 9);
         assert_eq!(&demo_start[..5], &[0x80, 0x07, 0x26, 0x13, 0x01]);
         assert!(parse_frame(&demo_start).is_some());
+
+        let bt_frame = crate::protocol::build_media_source_frame(1);
+        let (bt_cmd, bt_payload) = parse_frame(&bt_frame).expect("valid bt frame");
+        assert_eq!(bt_cmd, 0x72);
+        assert_eq!(bt_payload, &[0x00, 0x00, 0xC7]);
     }
 
     #[test]
@@ -400,5 +406,81 @@ mod tests {
         assert!(st.channel_clip_hold[0]);
         st.clear_all_clips();
         assert!(!st.channel_clip_hold[0]);
+
+        // Test Desplugar Todos (toggle_safe_unplug_all) preserving individual unplugged faders
+        st.set_channel_fader_db(SelectedChannel::Input(0), -6.0);
+        st.set_channel_fader_db(SelectedChannel::Input(1), -3.0);
+        st.toggle_safe_unplug(0);
+        assert!(st.is_safe_unplugged(0));
+        assert!(!st.all_safe_unplugged());
+        st.toggle_safe_unplug_all();
+        assert!(st.all_safe_unplugged());
+        assert!(st.channel_muted(SelectedChannel::Input(1)));
+        assert!((st.channel_fader_db(SelectedChannel::Input(1)) - (-120.0)).abs() < 0.2);
+        st.toggle_safe_unplug_all();
+        assert!(!st.all_safe_unplugged());
+        assert!((st.channel_fader_db(SelectedChannel::Input(0)) - (-6.0)).abs() < 0.2);
+        assert!((st.channel_fader_db(SelectedChannel::Input(1)) - (-3.0)).abs() < 0.2);
+        assert!(!st.channel_muted(SelectedChannel::Input(0)));
+
+        // Test Quick HPF 100Hz, A/B Compare, and Clean FX Return EQ
+        let ch0 = SelectedChannel::Input(0);
+        if st.is_hpf_active(ch0) {
+            st.toggle_quick_hpf_100hz(ch0);
+        }
+        st.toggle_quick_hpf_100hz(ch0);
+        assert!(st.is_hpf_active(ch0));
+        assert!((st.hpf_freq_hz(1, 0) - 100.0).abs() < 1.0);
+
+        st.toggle_ab_compare(ch0); // enters B
+        assert!(st.is_ab_b_active(ch0));
+        st.toggle_quick_hpf_100hz(ch0); // disable HPF in B
+        assert!(!st.is_hpf_active(ch0));
+        st.toggle_ab_compare(ch0); // back to A (HPF 100Hz active)
+        assert!(!st.is_ab_b_active(ch0));
+        assert!(st.is_hpf_active(ch0));
+
+        st.clean_fx_return_eq(0);
+        assert!(st.eq_enabled(2, 0));
+        assert!((st.hpf_freq_hz(2, 0) - 180.0).abs() < 1.0);
+        assert!((st.lpf_freq_hz(2, 0) - 7000.0).abs() < 10.0);
+    }
+
+    #[test]
+    fn test_multitrack_wav_loader() {
+        use crate::multitrack::{clean_track_name, MultitrackEngine, MT_SAMPLE_RATE};
+        let dir = std::env::temp_dir().join("axios24_mtk_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let wav_path = dir.join("01_Voz_Lider.wav");
+        // Write a tiny valid 16-bit PCM mono 48kHz WAV (480 samples = 10ms)
+        let num_samples: u32 = 480;
+        let data_bytes = num_samples * 2;
+        let mut buf = Vec::with_capacity(44 + data_bytes as usize);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        buf.extend_from_slice(b"WAVEfmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        buf.extend_from_slice(&1u16.to_le_bytes()); // mono
+        buf.extend_from_slice(&(MT_SAMPLE_RATE as u32).to_le_bytes());
+        buf.extend_from_slice(&((MT_SAMPLE_RATE as u32) * 2).to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_bytes.to_le_bytes());
+        for i in 0..num_samples {
+            let s = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / MT_SAMPLE_RATE as f32).sin()
+                * 16000.0) as i16;
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&wav_path, &buf).unwrap();
+
+        assert_eq!(clean_track_name(&wav_path), "Voz Lider");
+        let mut eng = MultitrackEngine::default();
+        let n = eng.load_wav_paths(&[wav_path.clone()]).expect("load wav");
+        assert_eq!(n, 1);
+        assert_eq!(eng.total_samples.load(std::sync::atomic::Ordering::Relaxed), 480);
+        let _ = std::fs::remove_file(&wav_path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

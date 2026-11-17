@@ -8,6 +8,9 @@
 *.scn
 *.SP1
 *.SP6
+*.wav
+*.zip
+/multitrack_demo/
 preset.bin
 preset_backup.bin
 axios24_prefs.ini

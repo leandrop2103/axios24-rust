@@ -1,6 +1,6 @@
 [package]
 name = "axios24"
-version = "0.3.8"
+version = "0.4.1"
 edition = "2021"
 description = "Duonn Axios 24 Digital Mixer Control Software (Modernized DS Mixer UI in Rust)"
 build = "build.rs"
@@ -15,6 +15,10 @@ png = "0.18"
 
 [build-dependencies]
 winresource = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = "0.15"
+midir = "0.10"
 
 [profile.release]
 opt-level = "z"

@@ -3,9 +3,9 @@ use crate::dsp::{
     decode_hpf_lpf_id, encode_hpf_lpf_id, FilterFamily, FilterSlope, PeqBandMode,
 };
 use crate::protocol::{
-    build_demo_cmd_frame, build_kv_frame, build_scene_op_frame, decode_official_scn,
-    decode_scene_block, encode_official_scn, load_or_create_preset_bin, probe_udp_devices,
-    save_preset_bin, DiscoveredDevice, FirmwareLayout, HardwareLink, NetEvent,
+    build_demo_cmd_frame, build_kv_frame, build_media_source_frame, build_scene_op_frame,
+    decode_official_scn, decode_scene_block, encode_official_scn, load_or_create_preset_bin,
+    probe_udp_devices, save_preset_bin, DiscoveredDevice, FirmwareLayout, HardwareLink, NetEvent,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -526,6 +526,11 @@ pub struct Axios24State {
     pub channel_clip_hold: [bool; 60],
     pub show_soundcheck_wizard: bool,
     pub soundcheck_step: usize,
+    pub personal_monitor_locked: bool,
+    /// Per-channel A/B compare snapshots for EQ + Gate + Compressor (indexed by flat_id 0..42)
+    pub ab_slots: Vec<Option<(Vec<(usize, u16)>, Vec<(usize, u16)>, bool)>>,
+    pub multitrack: crate::multitrack::MultitrackEngine,
+    pub multitrack_auto_name: bool,
 
     // GitHub Auto-Update
     pub update_info: Option<crate::updater::ReleaseUpdateInfo>,
@@ -667,6 +672,10 @@ impl Axios24State {
             channel_clip_hold: [false; 60],
             show_soundcheck_wizard: false,
             soundcheck_step: 0,
+            personal_monitor_locked: false,
+            ab_slots: vec![None; 42],
+            multitrack: crate::multitrack::MultitrackEngine::default(),
+            multitrack_auto_name: true,
             update_info: None,
             update_status: format!("Versão atual: v{}", crate::updater::CURRENT_VERSION),
             update_checking: false,
@@ -2068,6 +2077,248 @@ impl Axios24State {
         self.channel_clip_hold = [false; 60];
     }
 
+    /// Switches the physical mixer's Digital/Bluetooth input source (opcode 0x72)
+    pub fn set_media_source(&mut self, src: MediaSource) {
+        self.media.source = src;
+        if !matches!(self.hw_link.mode, crate::protocol::ConnectionMode::Demo) {
+            self.hw_link.send_frame(build_media_source_frame(src as u8));
+        }
+        self.toast(format!("Fonte Digital selecionada: {} (canal DIGI)", src.label()));
+    }
+
+    fn channel_eq_dyn_regs(sel: SelectedChannel) -> Vec<usize> {
+        let (group, ch) = sel.group_and_index();
+        let mut regs = Vec::new();
+        match group {
+            1 => {
+                // Gate (0x02..=0x07), Comp (0x1B..=0x21), EQ + HPF/LPF (0x24..=0x3D)
+                for p in 0x02..=0x07 {
+                    regs.push(map_reg(1, ch, p));
+                }
+                for p in 0x1B..=0x21 {
+                    regs.push(map_reg(1, ch, p));
+                }
+                for p in 0x24..=0x3D {
+                    regs.push(map_reg(1, ch, p));
+                }
+            }
+            2 => {
+                // FX 4-band PEQ + HPF/LPF (0xB9..=0xD2)
+                for p in 0xB9..=0xD2 {
+                    regs.push(map_reg(2, ch, p));
+                }
+            }
+            3 => {
+                // Output Comp (0x46..=0x4C), EQ + HPF/LPF + 7-band PEQ (0x4D..=0x73)
+                for p in 0x46..=0x73 {
+                    regs.push(map_reg(3, ch, p));
+                }
+            }
+            _ => {}
+        }
+        regs
+    }
+
+    pub fn is_ab_b_active(&self, sel: SelectedChannel) -> bool {
+        let id = sel.flat_id();
+        id < self.ab_slots.len() && matches!(self.ab_slots[id], Some((_, _, true)))
+    }
+
+    pub fn toggle_ab_compare(&mut self, sel: SelectedChannel) {
+        let id = sel.flat_id();
+        if id >= self.ab_slots.len() {
+            return;
+        }
+        let reg_ids = Self::channel_eq_dyn_regs(sel);
+        if reg_ids.is_empty() {
+            return;
+        }
+        let current: Vec<(usize, u16)> = reg_ids.iter().map(|&r| (r, self.get_reg(r))).collect();
+        match self.ab_slots[id].take() {
+            None => {
+                // First press: store current as A and B, switch to B so user can tweak B and compare against A
+                self.ab_slots[id] = Some((current.clone(), current, true));
+                self.toast(format!("Comparação A/B: Editando B em {} (A salvo)", self.channel_name(sel)));
+            }
+            Some((mut slot_a, mut slot_b, is_b)) => {
+                if is_b {
+                    slot_b = current;
+                    for &(r, v) in &slot_a {
+                        self.set_reg(r, v);
+                    }
+                    self.ab_slots[id] = Some((slot_a, slot_b, false));
+                    self.toast(format!("A/B: Ouvindo [A] (Original) em {}", self.channel_name(sel)));
+                } else {
+                    slot_a = current;
+                    for &(r, v) in &slot_b {
+                        self.set_reg(r, v);
+                    }
+                    self.ab_slots[id] = Some((slot_a, slot_b, true));
+                    self.toast(format!("A/B: Ouvindo [B] (Editado) em {}", self.channel_name(sel)));
+                }
+            }
+        }
+    }
+
+    pub fn copy_a_to_b(&mut self, sel: SelectedChannel) {
+        let id = sel.flat_id();
+        if id >= self.ab_slots.len() {
+            return;
+        }
+        let reg_ids = Self::channel_eq_dyn_regs(sel);
+        if reg_ids.is_empty() {
+            return;
+        }
+        let current: Vec<(usize, u16)> = reg_ids.iter().map(|&r| (r, self.get_reg(r))).collect();
+        self.ab_slots[id] = Some((current.clone(), current, false));
+        self.toast(format!("A/B sincronizado em {} (A = B)", self.channel_name(sel)));
+    }
+
+    pub fn is_hpf_active(&self, sel: SelectedChannel) -> bool {
+        let (group, ch) = sel.group_and_index();
+        if group == 4 {
+            return false;
+        }
+        let (_, hpf_en, _, _, _, _) = Self::eq_param_offsets(group);
+        self.eq_enabled(group, ch)
+            && self.get_reg(map_reg(group, ch, hpf_en)) != 0
+            && self.hpf_freq_hz(group, ch) >= 45.0
+    }
+
+    /// 1-click HPF 100Hz 18dB/oct toggle for quick low-end cleanup (vocals, guitars, overheads)
+    pub fn toggle_quick_hpf_100hz(&mut self, sel: SelectedChannel) {
+        let (group, ch) = sel.group_and_index();
+        if group == 4 {
+            return;
+        }
+        let (_, hpf_en, _, _, _, _) = Self::eq_param_offsets(group);
+        if self.is_hpf_active(sel) {
+            self.set_group_param(group, ch, hpf_en, 0);
+            self.set_hpf_freq_hz(group, ch, 20.0);
+            self.toast(format!("HPF desligado em {}", self.channel_name(sel)));
+        } else {
+            self.set_eq_enabled(group, ch, true);
+            self.set_group_param(group, ch, hpf_en, 1);
+            self.set_hpf_family_slope(group, ch, FilterFamily::Butterworth, FilterSlope::Slope18dB);
+            self.set_hpf_freq_hz(group, ch, 100.0);
+            self.toast(format!("HPF 100 Hz (18dB/oct) ativo em {}!", self.channel_name(sel)));
+        }
+    }
+
+    /// Cleans FX return mud & harsh highs (HPF 180Hz + LPF 7kHz) per live-sound best practice
+    pub fn clean_fx_return_eq(&mut self, fx_idx: usize) {
+        let fx = fx_idx.min(1);
+        let (_, hpf_en, _, _, _, _) = Self::eq_param_offsets(2);
+        self.set_eq_enabled(2, fx, true);
+        self.set_group_param(2, fx, hpf_en, 1);
+        self.set_hpf_family_slope(2, fx, FilterFamily::Butterworth, FilterSlope::Slope18dB);
+        self.set_hpf_freq_hz(2, fx, 180.0);
+        self.set_lpf_family_slope(2, fx, FilterFamily::Butterworth, FilterSlope::Slope12dB);
+        self.set_lpf_freq_hz(2, fx, 7000.0);
+        self.toast(format!(
+            "Volta FX{} limpa: HPF 180 Hz + LPF 7.0 kHz aplicados!",
+            fx + 1
+        ));
+    }
+
+    pub fn load_multitrack_files(&mut self, paths: &[PathBuf]) {
+        match self.multitrack.load_wav_paths(paths) {
+            Ok(count) => {
+                if self.multitrack_auto_name {
+                    let tracks = self.multitrack.tracks.lock().unwrap().clone();
+                    for tr in &tracks {
+                        if tr.channel_idx < 24 {
+                            self.set_channel_name(SelectedChannel::Input(tr.channel_idx), tr.name.clone());
+                        }
+                    }
+                }
+                self.toast(format!("Multitrack carregado: {} faixas prontas para mixar!", count));
+            }
+            Err(e) => {
+                self.toast(e);
+            }
+        }
+    }
+
+    pub fn sync_multitrack_dsp(&self) {
+        use crate::multitrack::{ChannelDspParams, ConsoleDspSnapshot, MT_MAX_CHANNELS};
+        let mut snap = ConsoleDspSnapshot::default();
+        for ch in 0..MT_MAX_CHANNELS {
+            let sel = SelectedChannel::Input(ch);
+            let (_, hpf_en, _, _, _, _) = Self::eq_param_offsets(1);
+            let (hpf_fam, hpf_slp) = self.hpf_family_slope(1, ch);
+            let (lpf_fam, lpf_slp) = self.lpf_family_slope(1, ch);
+            let mut peq = [(PeqBandMode::Peaking, 1000.0, 0.0, 1.0); 7];
+            for b_i in 0..4 {
+                let b = self.peq_band(1, ch, b_i);
+                peq[b_i] = (b.mode, b.freq_hz, b.gain_db, b.q);
+            }
+            snap.channels[ch] = ChannelDspParams {
+                gain_db: self.input_preamp_gain_db(ch),
+                fader_db: self.channel_fader_db(sel),
+                muted: self.channel_muted(sel),
+                solo: self.channel_solo(sel),
+                pan: self.input_pan(ch),
+                phase_invert: self.input_phase_invert(ch),
+                to_main_lr: self.input_to_main_lr(ch),
+                gate_enabled: self.input_gate_enabled(ch),
+                gate_threshold_db: self.input_gate_threshold_db(ch),
+                comp_enabled: self.comp_enabled(1, ch),
+                comp_threshold_db: self.comp_threshold_db(1, ch),
+                comp_ratio: self.comp_ratio(1, ch),
+                comp_gain_db: self.comp_gain_db(1, ch),
+                eq_enabled: self.eq_enabled(1, ch),
+                hpf_enabled: self.get_reg(map_reg(1, ch, hpf_en)) != 0,
+                hpf_freq: self.hpf_freq_hz(1, ch),
+                hpf_family: hpf_fam,
+                hpf_slope: hpf_slp,
+                lpf_enabled: self.lpf_freq_hz(1, ch) < 19900.0,
+                lpf_freq: self.lpf_freq_hz(1, ch),
+                lpf_family: lpf_fam,
+                lpf_slope: lpf_slp,
+                peq_count: 4,
+                is_output: false,
+                peq,
+            };
+        }
+        let build_out = |out_ch: usize| -> ChannelDspParams {
+            let (_, hpf_en, _, _, _, _) = Self::eq_param_offsets(3);
+            let (hpf_fam, hpf_slp) = self.hpf_family_slope(3, out_ch);
+            let (lpf_fam, lpf_slp) = self.lpf_family_slope(3, out_ch);
+            let mut peq = [(PeqBandMode::Peaking, 1000.0, 0.0, 1.0); 7];
+            for (b_i, slot) in peq.iter_mut().enumerate() {
+                let b = self.peq_band(3, out_ch, b_i);
+                *slot = (b.mode, b.freq_hz, b.gain_db, b.q);
+            }
+            ChannelDspParams {
+                comp_enabled: self.comp_enabled(3, out_ch),
+                comp_threshold_db: self.comp_threshold_db(3, out_ch),
+                comp_ratio: self.comp_ratio(3, out_ch),
+                comp_gain_db: self.comp_gain_db(3, out_ch),
+                eq_enabled: self.eq_enabled(3, out_ch),
+                hpf_enabled: self.get_reg(map_reg(3, out_ch, hpf_en)) != 0,
+                hpf_freq: self.hpf_freq_hz(3, out_ch),
+                hpf_family: hpf_fam,
+                hpf_slope: hpf_slp,
+                lpf_enabled: self.lpf_freq_hz(3, out_ch) < 19900.0,
+                lpf_freq: self.lpf_freq_hz(3, out_ch),
+                lpf_family: lpf_fam,
+                lpf_slope: lpf_slp,
+                peq_count: 7,
+                is_output: true,
+                peq,
+                ..ChannelDspParams::default()
+            }
+        };
+        snap.main_l = build_out(8);
+        snap.main_r = build_out(9);
+        snap.main_l_db = self.channel_fader_db(SelectedChannel::Output(8));
+        snap.main_r_db = self.channel_fader_db(SelectedChannel::Output(9));
+        snap.main_l_muted = self.channel_muted(SelectedChannel::Output(8));
+        snap.main_r_muted = self.channel_muted(SelectedChannel::Output(9));
+        *self.multitrack.snapshot.lock().unwrap() = snap;
+    }
+
     pub fn save_user_prefs(&self) {
         use std::fmt::Write;
         let mut out = String::new();
@@ -2451,8 +2702,22 @@ impl Axios24State {
             self.media.rec_seconds += dt;
         }
 
-        // Demo mode animated level meters & RTA spectrum
-        if self.demo_running {
+        // Demo mode animated level meters & RTA spectrum (or real Multitrack WAV meters when playing)
+        let mt_playing = self.multitrack.playing.load(std::sync::atomic::Ordering::Relaxed);
+        if mt_playing {
+            self.sync_multitrack_dsp();
+            let mt_m = *self.multitrack.channel_meters_db.lock().unwrap();
+            for ch in 0..24 {
+                let prev = self.channel_meters_db[ch];
+                self.channel_meters_db[ch] = if mt_m[ch] > prev {
+                    mt_m[ch]
+                } else {
+                    (prev - dt * 28.0).max(mt_m[ch])
+                };
+            }
+            self.channel_meters_db[36] = mt_m[24]; // MAIN L
+            self.channel_meters_db[37] = mt_m[25]; // MAIN R
+        } else if self.demo_running {
             let t = self.sim_time as f32;
             for i in 0..60 {
                 let sel = match i {
@@ -2662,30 +2927,60 @@ impl Axios24State {
         ch < 25 && self.safe_unplugged_inputs[ch]
     }
 
-    pub fn toggle_safe_unplug(&mut self, ch: usize) {
-        if ch >= 25 {
+    pub fn all_safe_unplugged(&self) -> bool {
+        (0..24).all(|ch| self.safe_unplugged_inputs[ch])
+    }
+
+    fn set_safe_unplug_state(&mut self, ch: usize, active: bool) {
+        if ch >= 25 || self.safe_unplugged_inputs[ch] == active {
             return;
         }
         let sel = SelectedChannel::Input(ch);
-        if !self.safe_unplugged_inputs[ch] {
+        if active {
             self.saved_fader_before_unplug[ch] = self.channel_fader_db(sel);
             self.safe_unplugged_inputs[ch] = true;
             self.set_channel_muted(sel, true);
             self.set_channel_fader_db(sel, -120.0);
-            self.toast(format!(
-                "Modo Desplugar ATIVO em {}: Pode desconectar o cabo sem estalo no PA!",
-                self.channel_name(sel)
-            ));
         } else {
             self.safe_unplugged_inputs[ch] = false;
             let restored = self.saved_fader_before_unplug[ch];
             self.set_channel_fader_db(sel, restored);
             self.set_channel_muted(sel, false);
+        }
+    }
+
+    pub fn toggle_safe_unplug(&mut self, ch: usize) {
+        if ch >= 25 {
+            return;
+        }
+        let sel = SelectedChannel::Input(ch);
+        let next = !self.safe_unplugged_inputs[ch];
+        self.set_safe_unplug_state(ch, next);
+        if next {
+            self.toast(format!(
+                "Modo Desplugar ATIVO em {}: Pode desconectar o cabo sem estalo no PA!",
+                self.channel_name(sel)
+            ));
+        } else {
+            let restored = self.saved_fader_before_unplug[ch];
             self.toast(format!(
                 "Cabo reconectado em {}: Volume restaurado para {:+.1} dB!",
                 self.channel_name(sel),
                 restored
             ));
+        }
+    }
+
+    /// Toggles Safe Unplug across all 24 input channels at once (end-of-service / stage shutdown)
+    pub fn toggle_safe_unplug_all(&mut self) {
+        let activate = !self.all_safe_unplugged();
+        for ch in 0..24 {
+            self.set_safe_unplug_state(ch, activate);
+        }
+        if activate {
+            self.toast("Desplugar TODOS ATIVO (CH1-24): Canais mutados em -120 dB para desligar com segurança!");
+        } else {
+            self.toast("Desplugar TODOS DESATIVADO (CH1-24): Volumes e mutes restaurados!");
         }
     }
 
