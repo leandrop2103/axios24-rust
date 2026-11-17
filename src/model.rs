@@ -5,7 +5,7 @@ use crate::dsp::{
 use crate::protocol::{
     build_demo_cmd_frame, build_kv_frame, build_scene_op_frame, decode_official_scn,
     decode_scene_block, encode_official_scn, load_or_create_preset_bin, probe_udp_devices,
-    save_preset_bin, DiscoveredDevice, HardwareLink, NetEvent,
+    save_preset_bin, DiscoveredDevice, FirmwareLayout, HardwareLink, NetEvent,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -518,6 +518,15 @@ pub struct Axios24State {
     pub net_link_lost: bool,
     pub midi: crate::midi::MidiControllerEngine,
 
+    // Pro Operator Features (Auto-Mixer, DCA Spill, Clip Hold, Soundcheck Wizard, Prefs Persistence)
+    pub automix_enabled: bool,
+    pub automix_channels: [bool; 24],
+    pub automix_atten_db: [f32; 24],
+    pub dca_spill: Option<usize>,
+    pub channel_clip_hold: [bool; 60],
+    pub show_soundcheck_wizard: bool,
+    pub soundcheck_step: usize,
+
     // GitHub Auto-Update
     pub update_info: Option<crate::updater::ReleaseUpdateInfo>,
     pub update_status: String,
@@ -651,6 +660,13 @@ impl Axios24State {
             net_ping_ms: 0,
             net_link_lost: false,
             midi: crate::midi::MidiControllerEngine::default(),
+            automix_enabled: false,
+            automix_channels: [false; 24],
+            automix_atten_db: [0.0; 24],
+            dca_spill: None,
+            channel_clip_hold: [false; 60],
+            show_soundcheck_wizard: false,
+            soundcheck_step: 0,
             update_info: None,
             update_status: format!("Versão atual: v{}", crate::updater::CURRENT_VERSION),
             update_checking: false,
@@ -659,6 +675,7 @@ impl Axios24State {
             update_check_rx: None,
             update_apply_rx: None,
         };
+        state.load_user_prefs();
         state.refresh_discovery();
         state.check_for_updates();
         state
@@ -1899,7 +1916,13 @@ impl Axios24State {
 
     pub fn export_scn_file(&mut self, path: &PathBuf) {
         let idx = self.active_scene_idx;
-        let bytes = encode_official_scn(idx + 1, &self.scene_names[idx], &self.channel_names, &self.regs);
+        let bytes = encode_official_scn(
+            idx + 1,
+            &self.scene_names[idx],
+            &self.channel_names,
+            &self.regs,
+            self.hw_link.firmware_layout,
+        );
         if fs::write(path, bytes).is_ok() {
             self.toast(format!("Cena exportada (.scn oficial): {}", path.display()));
         } else {
@@ -2041,6 +2064,132 @@ impl Axios24State {
         self.toast("Reconectando à mesa...");
     }
 
+    pub fn clear_all_clips(&mut self) {
+        self.channel_clip_hold = [false; 60];
+    }
+
+    pub fn save_user_prefs(&self) {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "DARK_THEME={}", if self.dark_theme { 1 } else { 0 });
+        let _ = writeln!(out, "AUTOMIX_ON={}", if self.automix_enabled { 1 } else { 0 });
+        let _ = writeln!(
+            out,
+            "FW_LAYOUT={}",
+            match self.hw_link.firmware_layout {
+                FirmwareLayout::Ax24e2511 => "AX24E",
+                FirmwareLayout::Legacy => "LEGACY",
+            }
+        );
+        for i in 0..60 {
+            if !self.channel_names[i].is_empty() {
+                let clean = self.channel_names[i].replace('\n', " ").replace('\r', "");
+                let _ = writeln!(out, "NAME_{}={}", i, clean);
+            }
+            let _ = writeln!(out, "COLOR_{}={}", i, self.channel_colors[i]);
+        }
+        for i in 0..24 {
+            if self.custom_link_groups[i] != 0 {
+                let _ = writeln!(out, "LINK_{}={}", i, self.custom_link_groups[i]);
+            }
+            if self.automix_channels[i] {
+                let _ = writeln!(out, "AUTOMIX_CH_{}=1", i);
+            }
+        }
+        for i in 0..42 {
+            if self.recall_safe_channels[i] {
+                let _ = writeln!(out, "SAFE_{}=1", i);
+            }
+        }
+        for b in &self.midi.bindings {
+            let _ = writeln!(
+                out,
+                "MIDI={},{},{},{},{}",
+                b.channel,
+                if b.is_note { 1 } else { 0 },
+                b.number,
+                b.target_flat_id,
+                if b.is_mute { 1 } else { 0 }
+            );
+        }
+        let _ = fs::write("axios24_prefs.ini", out);
+    }
+
+    pub fn load_user_prefs(&mut self) {
+        let Ok(txt) = fs::read_to_string("axios24_prefs.ini") else {
+            return;
+        };
+        for line in txt.lines() {
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            if k == "DARK_THEME" {
+                self.dark_theme = v.trim() != "0";
+            } else if k == "AUTOMIX_ON" {
+                self.automix_enabled = v.trim() == "1";
+            } else if k == "FW_LAYOUT" {
+                self.hw_link.firmware_layout = if v.trim().eq_ignore_ascii_case("LEGACY") {
+                    FirmwareLayout::Legacy
+                } else {
+                    FirmwareLayout::Ax24e2511
+                };
+            } else if let Some(idx_s) = k.strip_prefix("NAME_") {
+                if let Ok(idx) = idx_s.parse::<usize>() {
+                    if idx < 60 && !v.trim().is_empty() {
+                        self.channel_names[idx] = v.trim().to_string();
+                    }
+                }
+            } else if let Some(idx_s) = k.strip_prefix("COLOR_") {
+                if let Ok(idx) = idx_s.parse::<usize>() {
+                    if let Ok(c) = v.trim().parse::<u8>() {
+                        if idx < 60 {
+                            self.channel_colors[idx] = c % 32;
+                        }
+                    }
+                }
+            } else if let Some(idx_s) = k.strip_prefix("LINK_") {
+                if let Ok(idx) = idx_s.parse::<usize>() {
+                    if let Ok(g) = v.trim().parse::<u8>() {
+                        if idx < 24 {
+                            self.custom_link_groups[idx] = g.min(4);
+                        }
+                    }
+                }
+            } else if let Some(idx_s) = k.strip_prefix("AUTOMIX_CH_") {
+                if let Ok(idx) = idx_s.parse::<usize>() {
+                    if idx < 24 {
+                        self.automix_channels[idx] = v.trim() == "1";
+                    }
+                }
+            } else if let Some(idx_s) = k.strip_prefix("SAFE_") {
+                if let Ok(idx) = idx_s.parse::<usize>() {
+                    if idx < 42 {
+                        self.recall_safe_channels[idx] = v.trim() == "1";
+                    }
+                }
+            } else if k == "MIDI" {
+                let p: Vec<&str> = v.split(',').collect();
+                if p.len() == 5 {
+                    if let (Ok(ch), Ok(note), Ok(num), Ok(id), Ok(mute)) = (
+                        p[0].parse::<u8>(),
+                        p[1].parse::<u8>(),
+                        p[2].parse::<u8>(),
+                        p[3].parse::<usize>(),
+                        p[4].parse::<u8>(),
+                    ) {
+                        self.midi.bindings.push(crate::midi::MidiBinding {
+                            channel: ch.min(15),
+                            is_note: note != 0,
+                            number: num.min(127),
+                            target_flat_id: id.min(41),
+                            is_mute: mute != 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     pub fn set_demo_running(&mut self, run: bool) {
         self.demo_running = run;
         self.hw_link.send_frame(build_demo_cmd_frame(run));
@@ -2165,14 +2314,21 @@ impl Axios24State {
             match ev {
                 NetEvent::ParamUpdates(pairs) => {
                     got_hw_packet = true;
+                    if pairs.iter().any(|&(r, _)| r as usize >= NUM_REGS) {
+                        self.hw_link.firmware_layout = FirmwareLayout::Ax24e2511;
+                    }
+                    let layout = self.hw_link.firmware_layout;
                     for (reg, val) in pairs {
-                        if (reg as usize) < NUM_REGS {
-                            self.regs[reg as usize] = val;
+                        if let Some(r) = layout.from_device(reg) {
+                            self.regs[r as usize] = val;
                         }
                     }
                 }
                 NetEvent::DeviceDiscovered(dev) => {
                     got_hw_packet = true;
+                    if let Some(layout) = FirmwareLayout::detect(&dev.name, &dev.fw_version) {
+                        self.hw_link.firmware_layout = layout;
+                    }
                     if !self.discovered_devices.iter().any(|d| d.ip == dev.ip) {
                         self.discovered_devices.push(dev);
                     }
@@ -2329,18 +2485,6 @@ impl Axios24State {
                 } else {
                     (prev - dt * 28.0).max(level)
                 };
-
-                // Compute live Compressor Gain Reduction (GR) in dB
-                let (c_grp, c_ch) = sel.group_and_index();
-                if (c_grp == 1 || c_grp == 3) && self.comp_enabled(c_grp, c_ch) {
-                    let th = self.comp_threshold_db(c_grp, c_ch);
-                    let ratio = self.comp_ratio(c_grp, c_ch).max(1.0);
-                    let over = (self.channel_meters_db[i] - th).max(0.0);
-                    let gr = over * (1.0 - 1.0 / ratio);
-                    self.comp_gr_db[i] = gr.clamp(0.0, 24.0);
-                } else {
-                    self.comp_gr_db[i] = 0.0;
-                }
             }
 
             // RTA 64-band spectrum shaped by the currently selected channel's EQ!
@@ -2383,6 +2527,12 @@ impl Axios24State {
                 self.rta_peak_db = best_v;
             }
         } else {
+            for i in 0..42 {
+                let sel = SelectedChannel::from_flat_id(i);
+                if self.channel_meters_db[i] >= -0.5 && !self.channel_muted(sel) {
+                    self.channel_clip_hold[i] = true;
+                }
+            }
             for m in &mut self.channel_meters_db {
                 *m = (*m - dt * 40.0).max(-90.0);
             }
@@ -2412,6 +2562,53 @@ impl Axios24State {
                 let flat = self.selected_channel.flat_id();
                 self.channel_meters_db[flat] = snap.input_rms_db;
             }
+        }
+
+        // Update persistent CLIP hold & live Compressor Gain Reduction (GR) across all channels
+        for i in 0..42 {
+            let sel = SelectedChannel::from_flat_id(i);
+            if self.channel_meters_db[i] >= -0.5 && !self.channel_muted(sel) {
+                self.channel_clip_hold[i] = true;
+            }
+            let (c_grp, c_ch) = sel.group_and_index();
+            if (c_grp == 1 || c_grp == 3) && self.comp_enabled(c_grp, c_ch) {
+                let th = self.comp_threshold_db(c_grp, c_ch);
+                let ratio = self.comp_ratio(c_grp, c_ch).max(1.0);
+                let over = (self.channel_meters_db[i] - th).max(0.0);
+                let gr = over * (1.0 - 1.0 / ratio);
+                self.comp_gr_db[i] = gr.clamp(0.0, 24.0);
+            } else {
+                self.comp_gr_db[i] = 0.0;
+            }
+        }
+
+        // Dugan-style Auto-Mixer gain sharing across enabled speech channels
+        if self.automix_enabled {
+            let active_chs: Vec<usize> = (0..24)
+                .filter(|&c| self.automix_channels[c] && !self.channel_muted(SelectedChannel::Input(c)))
+                .collect();
+            if active_chs.len() >= 2 {
+                let mut sum_lin = 0.0_f32;
+                for &c in &active_chs {
+                    sum_lin += 10.0_f32.powf(self.channel_meters_db[c] / 20.0);
+                }
+                let sum_lin = sum_lin.max(1e-6);
+                for c in 0..24 {
+                    if self.automix_channels[c] {
+                        let ch_lin = 10.0_f32.powf(self.channel_meters_db[c] / 20.0);
+                        let ratio = (ch_lin / sum_lin).clamp(0.25, 1.0);
+                        let atten = (20.0 * ratio.log10()).clamp(-12.0, 0.0);
+                        self.automix_atten_db[c] =
+                            self.automix_atten_db[c] * 0.8 + atten * 0.2;
+                    } else {
+                        self.automix_atten_db[c] = 0.0;
+                    }
+                }
+            } else {
+                self.automix_atten_db = [0.0; 24];
+            }
+        } else {
+            self.automix_atten_db = [0.0; 24];
         }
     }
 

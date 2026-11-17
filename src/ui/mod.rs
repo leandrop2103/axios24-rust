@@ -38,6 +38,11 @@ pub fn render_app(
         render_update_modal(ctx, state);
     }
 
+    // Guided Soundcheck Assistant Wizard
+    if state.show_soundcheck_wizard {
+        render_soundcheck_wizard(ctx, state);
+    }
+
     let dark = state.dark_theme;
     let bar_bg = if dark { Color32::from_rgb(13, 17, 25) } else { Color32::from_rgb(228, 234, 244) };
     let bar_border = if dark { Color32::from_rgb(34, 45, 62) } else { Color32::from_rgb(185, 198, 215) };
@@ -524,6 +529,7 @@ fn render_bottom_bar(ui: &mut Ui, state: &mut Axios24State) {
             .clicked()
             {
                 state.layer = ly;
+                state.dca_spill = None;
             }
         }
 
@@ -747,6 +753,8 @@ fn handle_keyboard_shortcuts(ctx: &egui::Context, state: &mut Axios24State) {
             state.show_search_bar = false;
             state.channel_search_query.clear();
             state.show_connect_modal = false;
+            state.dca_spill = None;
+            state.show_soundcheck_wizard = false;
         } else if i.key_pressed(egui::Key::F1) {
             state.layer = FaderLayer::Ch1_8;
         } else if i.key_pressed(egui::Key::F2) {
@@ -993,6 +1001,47 @@ fn render_mixer_workspace(ui: &mut Ui, state: &mut Axios24State) {
                     {
                         state.top_tab = TopNavTab::EditChannel;
                     }
+                    if ui
+                        .small_button("\u{f0e7} Soundcheck")
+                        .on_hover_text("Assistente guiado de passagem de som em 4 passos (Ganho -> HPF/Gate -> EQ -> Comp/L&R)")
+                        .clicked()
+                    {
+                        state.show_soundcheck_wizard = !state.show_soundcheck_wizard;
+                        state.soundcheck_step = 0;
+                    }
+                    if let (1, ch) = sel.group_and_index() {
+                        if ch < 24 {
+                            let am = state.automix_channels[ch];
+                            if draw_pill_button(
+                                ui,
+                                if am { "AUTOMIX ON" } else { "AUTOMIX" },
+                                am,
+                                Color32::from_rgb(155, 89, 182),
+                                Vec2::new(78.0, 20.0),
+                            )
+                            .on_hover_text("Auto-Mixer (Dugan): Equilibra vários microfones de voz abertos evitando microfonia")
+                            .clicked()
+                            {
+                                state.automix_channels[ch] = !am;
+                                if !am {
+                                    state.automix_enabled = true;
+                                }
+                            }
+                        }
+                    }
+                    if state.channel_clip_hold.iter().any(|&c| c) {
+                        if draw_pill_button(
+                            ui,
+                            "Limpar Clips",
+                            true,
+                            Color32::from_rgb(220, 38, 38),
+                            Vec2::new(82.0, 20.0),
+                        )
+                        .clicked()
+                        {
+                            state.clear_all_clips();
+                        }
+                    }
                 });
             });
     ui.add_space(3.0);
@@ -1164,9 +1213,33 @@ fn render_mixer_workspace(ui: &mut Ui, state: &mut Axios24State) {
     ui.add_space(3.0);
 
     // Channel Strips Fader Bank — Expands across 100% of the available central width!
+    if let Some(dca_idx) = state.dca_spill {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "\u{f0c1} MODO DCA SPILL ATIVO: {} (Mostrando apenas canais do grupo)",
+                    state.channel_name(SelectedChannel::Dca(dca_idx))
+                ))
+                .size(12.0)
+                .strong()
+                .color(Color32::from_rgb(241, 196, 15)),
+            );
+            if ui.small_button("Sair do Spill (Esc)").clicked() {
+                state.dca_spill = None;
+            }
+        });
+    }
+
     let strips_h = ui.available_height().max(120.0);
     let avail_w = ui.available_width();
-    let mut channels = if !state.channel_search_query.trim().is_empty() {
+    let mut channels = if let Some(dca_idx) = state.dca_spill {
+        let mut list: Vec<SelectedChannel> = (0..38)
+            .filter(|&flat| state.is_in_dca_group(dca_idx, flat))
+            .map(SelectedChannel::from_flat_id)
+            .collect();
+        list.push(SelectedChannel::Dca(dca_idx));
+        list
+    } else if !state.channel_search_query.trim().is_empty() {
         let q = state.channel_search_query.trim().to_lowercase();
         let all_candidates: Vec<SelectedChannel> = (0..25)
             .map(SelectedChannel::Input)
@@ -4030,6 +4103,44 @@ fn render_connect_modal(ctx: &egui::Context, state: &mut Axios24State) {
             }
         });
 
+        // Seleção do Firmware da Mesa (AX24E 25.11.01.001 vs Legado v1.0.25.0328)
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Firmware da Mesa:").size(14.0).strong());
+            for layout in [
+                crate::protocol::FirmwareLayout::Ax24e2511,
+                crate::protocol::FirmwareLayout::Legacy,
+            ] {
+                let active = state.hw_link.firmware_layout == layout;
+                let btn = egui::Button::new(
+                    RichText::new(layout.label())
+                        .size(13.0)
+                        .strong()
+                        .color(if active {
+                            Color32::WHITE
+                        } else if dark {
+                            Color32::from_rgb(220, 230, 242)
+                        } else {
+                            Color32::from_rgb(30, 40, 55)
+                        }),
+                )
+                .fill(if active {
+                    Color32::from_rgb(0, 145, 195)
+                } else {
+                    panel_box
+                })
+                .min_size(Vec2::new(0.0, 26.0));
+                if ui
+                    .add(btn)
+                    .on_hover_text(
+                        "Seleciona o mapa de registradores DSP da mesa (detectado automaticamente na rede, ou escolha manualmente para USB Serial / exportação .scn).",
+                    )
+                    .clicked()
+                {
+                    state.hw_link.firmware_layout = layout;
+                }
+            }
+        });
+
         // IP Manual + Botões de Conexão
         ui.horizontal(|ui| {
             ui.label(RichText::new("IP do Mixer:").size(15.0).strong());
@@ -4250,5 +4361,139 @@ fn render_update_modal(ctx: &egui::Context, state: &mut Axios24State) {
     });
     if !open {
         state.show_update_modal = false;
+    }
+}
+
+fn render_soundcheck_wizard(ctx: &egui::Context, state: &mut Axios24State) {
+    let mut open = state.show_soundcheck_wizard;
+    let sel = state.selected_channel;
+    let (group, ch) = sel.group_and_index();
+    let g = group.max(1).min(3);
+    let c = if group == 4 { 0 } else { ch };
+
+    egui::Window::new(
+        RichText::new(format!("\u{f0e7} Soundcheck Rápido — {}", state.channel_name(sel)))
+            .size(15.5)
+            .strong(),
+    )
+    .open(&mut open)
+    .collapsible(false)
+    .resizable(false)
+    .default_width(520.0)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    .show(ctx, |ui| {
+        ui.spacing_mut().item_spacing.y = 8.0;
+
+        // Step Progress Pills
+        ui.horizontal(|ui| {
+            let steps = ["1. Ganho & +48V", "2. HPF & Gate", "3. Preset & EQ", "4. Comp & L/R"];
+            for (idx, lbl) in steps.iter().enumerate() {
+                if draw_pill_button(
+                    ui,
+                    lbl,
+                    state.soundcheck_step == idx,
+                    Color32::from_rgb(0, 188, 212),
+                    Vec2::new(118.0, 24.0),
+                )
+                .clicked()
+                {
+                    state.soundcheck_step = idx;
+                }
+            }
+        });
+        ui.separator();
+
+        match state.soundcheck_step {
+            0 => {
+                ui.label(RichText::new("Passo 1: Ajuste o Ganho de Entrada (Estrutura de Ganho)").strong().size(14.0));
+                ui.label("Peça para o músico/cantor tocar ou falar no volume máximo e ajuste o ganho para ficar na faixa verde/amarela (-18 dB a -6 dB), sem bater em CLIP.");
+                if g == 1 && c < 24 {
+                    let mut gain = state.input_preamp_gain_db(c);
+                    ui.add(egui::Slider::new(&mut gain, 0.0..=60.0).text("Ganho (dB)"));
+                    state.set_input_preamp_gain_db(c, gain);
+                    ui.horizontal(|ui| {
+                        let p48 = state.input_phantom_48v(c);
+                        if draw_pill_button(ui, "+48V Phantom", p48, Color32::from_rgb(231, 76, 60), Vec2::new(110.0, 24.0)).clicked() {
+                            state.set_input_phantom_48v(c, !p48);
+                        }
+                        if ui.button("\u{f0e7} Auto-Gain (-18 dB)").clicked() {
+                            state.run_auto_gain(c);
+                        }
+                    });
+                }
+            }
+            1 => {
+                ui.label(RichText::new("Passo 2: Corte de Graves (HPF) e Noise Gate").strong().size(14.0));
+                ui.label("Use o HPF para limpar graves indesejados (Voz ~100 Hz, Violão ~110 Hz, Baixo ~35 Hz). Use Gate apenas se houver vazamento.");
+                let mut hpf = state.hpf_freq_hz(g, c);
+                if ui.add(egui::Slider::new(&mut hpf, 20.0..=400.0).text("HPF (Hz)")).changed() {
+                    state.set_hpf_freq_hz(g, c, hpf);
+                }
+                if g == 1 {
+                    let mut gon = state.input_gate_enabled(c);
+                    if ui.checkbox(&mut gon, "Ativar Noise Gate").changed() {
+                        state.set_input_gate_enabled(c, gon);
+                    }
+                    let mut gth = state.input_gate_threshold_db(c);
+                    if ui.add(egui::Slider::new(&mut gth, -80.0..=0.0).text("Gate Threshold (dB)")).changed() {
+                        state.set_input_gate_threshold_db(c, gth);
+                    }
+                }
+            }
+            2 => {
+                ui.label(RichText::new("Passo 3: Preset Inicial e Equalização").strong().size(14.0));
+                ui.label("Escolha o instrumento abaixo para carregar o ponto de partida ideal de EQ/Crossover:");
+                ui.horizontal_wrapped(|ui| {
+                    for p in ChannelPreset::ALL {
+                        if ui.button(p.label()).clicked() {
+                            state.apply_channel_preset(sel, p);
+                        }
+                    }
+                });
+            }
+            _ => {
+                ui.label(RichText::new("Passo 4: Compressor, Envio L/R e Volume Inicial").strong().size(14.0));
+                let mut con = state.comp_enabled(g, c);
+                if ui.checkbox(&mut con, "Ativar Compressor Dinâmico").changed() {
+                    state.set_comp_enabled(g, c, con);
+                }
+                if g == 1 {
+                    let lr = state.input_to_main_lr(c);
+                    if draw_pill_button(
+                        ui,
+                        if lr { "Enviando p/ MAIN L/R (ATIVO)" } else { "ATIVAR ENVIO P/ MAIN L/R" },
+                        lr,
+                        Color32::from_rgb(0, 188, 212),
+                        Vec2::new(220.0, 26.0),
+                    )
+                    .clicked()
+                    {
+                        state.set_input_to_main_lr(c, !lr);
+                    }
+                }
+                let mut fdb = state.channel_fader_db(sel);
+                if ui.add(egui::Slider::new(&mut fdb, -120.0..=10.0).text("Fader (dB)")).changed() {
+                    state.set_channel_fader_db(sel, fdb);
+                }
+            }
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if state.soundcheck_step > 0 && ui.button("<- Anterior").clicked() {
+                state.soundcheck_step -= 1;
+            }
+            if state.soundcheck_step < 3 {
+                if ui.button("Próximo ->").clicked() {
+                    state.soundcheck_step += 1;
+                }
+            } else if ui.button("\u{f00c} Concluir Soundcheck").clicked() {
+                state.show_soundcheck_wizard = false;
+            }
+        });
+    });
+
+    if !open {
+        state.show_soundcheck_wizard = false;
     }
 }

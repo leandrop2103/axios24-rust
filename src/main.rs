@@ -84,6 +84,10 @@ impl eframe::App for Axios24App {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.state.save_user_prefs();
+    }
 }
 
 fn configure_fonts(ctx: &egui::Context) {
@@ -197,7 +201,8 @@ mod tests {
 
     #[test]
     fn test_import_igreja_scn_and_official_roundtrip() {
-        use crate::protocol::{decode_official_scn, encode_official_scn};
+        use crate::model::map_reg;
+        use crate::protocol::{decode_official_scn, encode_official_scn, FirmwareLayout};
         if !std::path::Path::new("igreja.scn").exists() {
             return;
         }
@@ -212,11 +217,27 @@ mod tests {
         let ch_names: [String; 60] = std::array::from_fn(|i| {
             scn.text.get(i).cloned().unwrap_or_default()
         });
-        let reencoded = encode_official_scn(1, &scn.name, &ch_names, &scn.regs);
-        let scn2 = decode_official_scn(&reencoded).expect("roundtrip official scn");
+        let reencoded_legacy =
+            encode_official_scn(1, &scn.name, &ch_names, &scn.regs, FirmwareLayout::Legacy);
+        let scn2 = decode_official_scn(&reencoded_legacy).expect("roundtrip legacy official scn");
         assert_eq!(scn2.name, "Padrao");
         assert_eq!(scn2.regs, scn.regs);
         assert_eq!(scn2.text[0], "Vermelho");
+
+        // Also verify AX24E.25.11.01.001 (3518-register) .scn roundtrip and register translation
+        let ax = FirmwareLayout::Ax24e2511;
+        assert_eq!(ax.to_device(map_reg(1, 0, 0xEC) as u16), 0x0057); // CH1 fader unchanged
+        assert_eq!(ax.to_device(map_reg(3, 8, 0xEC) as u16), 0x0A00); // MAIN L fader unchanged
+        assert_eq!(ax.to_device(map_reg(2, 0, 0xEC) as u16), 0x0B5F); // FX1 fader 0xB3B -> 0xB5F
+        assert_eq!(ax.to_device(map_reg(4, 0, 0xEC) as u16), 0x0BCE); // DCA1 fader 0xBAA -> 0xBCE
+        assert_eq!(ax.to_device(0x0BCC), 0x0BF0); // MAIN L/R stereo link bitmask 0xBCC -> 0xBF0
+
+        let reencoded_ax24e =
+            encode_official_scn(1, &scn.name, &ch_names, &scn.regs, FirmwareLayout::Ax24e2511);
+        let scn3 = decode_official_scn(&reencoded_ax24e).expect("roundtrip AX24E 25.11 official scn");
+        assert_eq!(scn3.regs[..0xB2F], scn.regs[..0xB2F]);
+        assert_eq!(scn3.regs[0xB2F..=0xC00], scn.regs[0xB2F..=0xC00]);
+        assert_eq!(scn3.regs[0xC01..], scn.regs[0xC01..]);
     }
 
     #[test]
@@ -357,5 +378,27 @@ mod tests {
         // Undo must restore CH2 back to -12.0 dB
         st.undo();
         assert!((st.channel_fader_db(SelectedChannel::Input(1)) - (-12.0)).abs() < 0.2);
+    }
+
+    #[test]
+    fn test_automix_clip_and_prefs_roundtrip() {
+        use crate::model::{Axios24State, SelectedChannel};
+        let mut st = Axios24State::new();
+        st.automix_enabled = true;
+        st.automix_channels[0] = true;
+        st.automix_channels[1] = true;
+        st.channel_meters_db[0] = -10.0;
+        st.channel_meters_db[1] = -30.0;
+        st.demo_running = false;
+        st.tick(0.05);
+        // Quieter mic CH2 should be attenuated more than active mic CH1
+        assert!(st.automix_atten_db[1] < st.automix_atten_db[0]);
+
+        st.channel_meters_db[0] = 0.0;
+        st.set_channel_muted(SelectedChannel::Input(0), false);
+        st.tick(0.02);
+        assert!(st.channel_clip_hold[0]);
+        st.clear_all_clips();
+        assert!(!st.channel_clip_hold[0]);
     }
 }

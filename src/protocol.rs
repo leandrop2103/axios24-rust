@@ -22,6 +22,94 @@ pub const DUONN_FACTORY_IPS: [(&str, &str); 4] = [
     ("172.14.30.1", "Axios 32"),
 ];
 
+/// Register count used by the newer `AX24E.25.11.01.001` software/firmware (0xDBE = 3518)
+pub const AX24E_NUM_REGS: usize = 0xDBE;
+
+/// Mixer firmware register layout.
+///
+/// The wire protocol (framing, CRC, opcodes, ports, KV discovery) is identical between
+/// `axios24new.exe v1.0.25.0328` and `AX24E.25.11.01.001`, but the newer firmware inserted
+/// 36 registers at 0xB2F (input/output channel mapping) and 69 registers after old 0xC00
+/// (GEQ / new FX parameters). The app model keeps the legacy 3413-register layout internally
+/// and translates indices only at the hardware / `.scn` boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FirmwareLayout {
+    /// axios24new.exe v1.0.25.0328 (3413 registers)
+    Legacy,
+    /// AX24E.25.11.01.001 build 1018 (3518 registers)
+    Ax24e2511,
+}
+
+impl FirmwareLayout {
+    pub fn label(self) -> &'static str {
+        match self {
+            FirmwareLayout::Legacy => "Legado v1.0.25.0328 (3413 regs)",
+            FirmwareLayout::Ax24e2511 => "AX24E 25.11.01.001 (3518 regs)",
+        }
+    }
+
+    pub fn num_regs(self) -> usize {
+        match self {
+            FirmwareLayout::Legacy => NUM_REGS,
+            FirmwareLayout::Ax24e2511 => AX24E_NUM_REGS,
+        }
+    }
+
+    /// Converts an internal (legacy) register index into this firmware's register index
+    pub fn to_device(self, reg: u16) -> u16 {
+        match self {
+            FirmwareLayout::Legacy => reg,
+            FirmwareLayout::Ax24e2511 => {
+                if reg < 0xB2F {
+                    reg
+                } else if reg <= 0xC00 {
+                    reg + 0x24
+                } else {
+                    reg + 0x69
+                }
+            }
+        }
+    }
+
+    /// Converts a device register index back into the internal (legacy) index.
+    /// Returns `None` for registers that only exist on the newer firmware.
+    pub fn from_device(self, reg: u16) -> Option<u16> {
+        let r = match self {
+            FirmwareLayout::Legacy => reg,
+            FirmwareLayout::Ax24e2511 => {
+                if reg < 0xB2F {
+                    reg
+                } else if reg < 0xB53 {
+                    return None;
+                } else if reg <= 0xC24 {
+                    reg - 0x24
+                } else if reg < 0xC6A {
+                    return None;
+                } else {
+                    reg - 0x69
+                }
+            }
+        };
+        if (r as usize) < NUM_REGS {
+            Some(r)
+        } else {
+            None
+        }
+    }
+
+    /// Best-effort detection from the KV discovery reply (`DEVNAME=` / `FW_VER=`)
+    pub fn detect(dev_name: &str, fw_version: &str) -> Option<FirmwareLayout> {
+        let s = format!("{} {}", dev_name, fw_version).to_ascii_uppercase();
+        if s.contains("AX24E") || s.contains("AXIOS24E") || s.contains("25.11") {
+            Some(FirmwareLayout::Ax24e2511)
+        } else if s.contains("1.0.25.0328") {
+            Some(FirmwareLayout::Legacy)
+        } else {
+            None
+        }
+    }
+}
+
 /// Exact CRC-16 (Modbus polynomial 0xA001, init 0xFFFF) from fcn.0045a3b0
 pub fn crc16_axios(data: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
@@ -264,20 +352,30 @@ pub fn decode_official_scn(bytes: &[u8]) -> Option<OfficialSceneFile> {
         return None;
     }
 
-    let mut regs = DEFAULT_REGS;
     let hex_bytes = data_hex.as_bytes();
+    let mut pairs: Vec<(u16, u16)> = Vec::with_capacity(hex_bytes.len() / 8);
     let mut i = 0;
-    let mut parsed_count = 0usize;
     while i + 8 <= hex_bytes.len() {
         let reg_str = std::str::from_utf8(&hex_bytes[i..i + 4]).ok()?;
         let val_str = std::str::from_utf8(&hex_bytes[i + 4..i + 8]).ok()?;
         if let (Ok(reg), Ok(val)) = (u16::from_str_radix(reg_str, 16), u16::from_str_radix(val_str, 16)) {
-            if (reg as usize) < NUM_REGS {
-                regs[reg as usize] = val;
-                parsed_count += 1;
-            }
+            pairs.push((reg, val));
         }
         i += 8;
+    }
+    // Scenes saved by AX24E 25.11 contain 3518 registers (indices above legacy 0xD54)
+    let layout = if pairs.iter().any(|&(r, _)| r as usize >= NUM_REGS) {
+        FirmwareLayout::Ax24e2511
+    } else {
+        FirmwareLayout::Legacy
+    };
+    let mut regs = DEFAULT_REGS;
+    let mut parsed_count = 0usize;
+    for (reg, val) in pairs {
+        if let Some(r) = layout.from_device(reg) {
+            regs[r as usize] = val;
+            parsed_count += 1;
+        }
     }
     if parsed_count < 100 {
         return None;
@@ -295,10 +393,28 @@ pub fn encode_official_scn(
     scene_name: &str,
     channel_names: &[String; 60],
     regs: &[u16; NUM_REGS],
+    layout: FirmwareLayout,
 ) -> Vec<u8> {
     use std::fmt::Write;
-    let mut data_hex = String::with_capacity(NUM_REGS * 8);
+    let n = layout.num_regs();
+    // Fill a full device-layout image; initialize 1-to-1 I/O channel mapping (0xB2F..0xB52) for AX24E
+    let mut dev = vec![0u16; n];
+    if matches!(layout, FirmwareLayout::Ax24e2511) {
+        for i in 0..26 {
+            dev[0xB2F + i] = (i + 1) as u16;
+        }
+        for i in 0..10 {
+            dev[0xB49 + i] = (i + 1) as u16;
+        }
+    }
     for (r, &v) in regs.iter().enumerate() {
+        let d = layout.to_device(r as u16) as usize;
+        if d < n {
+            dev[d] = v;
+        }
+    }
+    let mut data_hex = String::with_capacity(n * 8);
+    for (r, &v) in dev.iter().enumerate() {
         let _ = write!(data_hex, "{:04X}{:04X}", r, v);
     }
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
@@ -356,6 +472,7 @@ pub enum NetEvent {
 
 pub struct HardwareLink {
     pub mode: ConnectionMode,
+    pub firmware_layout: FirmwareLayout,
     tx_out: Option<Sender<Vec<u8>>>,
     rx_in: Option<Receiver<NetEvent>>,
 }
@@ -364,6 +481,7 @@ impl Default for HardwareLink {
     fn default() -> Self {
         Self {
             mode: ConnectionMode::Demo,
+            firmware_layout: FirmwareLayout::Ax24e2511,
             tx_out: None,
             rx_in: None,
         }
@@ -559,18 +677,20 @@ impl HardwareLink {
 
     pub fn send_param(&self, reg: u16, val: u16) {
         if !matches!(self.mode, ConnectionMode::Demo) {
-            self.send_frame(build_param_write_frame(&[(reg, val)]));
+            let dev_reg = self.firmware_layout.to_device(reg);
+            self.send_frame(build_param_write_frame(&[(dev_reg, val)]));
         }
     }
 
-    /// Sends all 3,413 DSP registers to the hardware in safe 24-register frames so offline edits sync completely
+    /// Sends all DSP registers to the hardware in safe 24-register frames so offline edits sync completely
     pub fn sync_all_registers(&self, regs: &[u16; NUM_REGS]) {
         if matches!(self.mode, ConnectionMode::Demo) {
             return;
         }
         let mut batch = Vec::with_capacity(24);
         for (idx, &val) in regs.iter().enumerate() {
-            batch.push((idx as u16, val));
+            let dev_reg = self.firmware_layout.to_device(idx as u16);
+            batch.push((dev_reg, val));
             if batch.len() == 24 {
                 self.send_frame(build_param_write_frame(&batch));
                 batch.clear();

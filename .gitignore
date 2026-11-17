@@ -6,7 +6,10 @@
 *.tmp
 *.log
 *.scn
+*.SP1
+*.SP6
 preset.bin
 preset_backup.bin
+axios24_prefs.ini
 .DS_Store
 Thumbs.db

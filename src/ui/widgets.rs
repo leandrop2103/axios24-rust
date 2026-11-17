@@ -1952,6 +1952,37 @@ pub fn draw_channel_strip(
         strip_color
     };
 
+    if group == 4 && !is_master_section {
+        let spilled = state.dca_spill == Some(ch);
+        if draw_pill_button(
+            &mut child_ui,
+            if spilled { "SPILL ON" } else { "SPILL" },
+            spilled,
+            Color32::from_rgb(241, 196, 15),
+            Vec2::new(inner_w, 16.0),
+        )
+        .on_hover_text("DCA Spill: Exibe na tela apenas os canais que fazem parte deste DCA")
+        .clicked()
+        {
+            state.dca_spill = if spilled { None } else { Some(ch) };
+        }
+    }
+
+    if state.channel_clip_hold[flat_id] {
+        if draw_pill_button(
+            &mut child_ui,
+            "CLIP!",
+            true,
+            Color32::from_rgb(220, 38, 38),
+            Vec2::new(inner_w, 15.0),
+        )
+        .on_hover_text("Pico acima de 0 dBFS detectado! Clique para limpar o alerta de CLIP")
+        .clicked()
+        {
+            state.channel_clip_hold[flat_id] = false;
+        }
+    }
+
     child_ui.label(
         egui::RichText::new(format_fader_db(fader_db))
             .size(10.0)
@@ -2253,15 +2284,31 @@ fn show_channel_context_menu(resp: &Response, state: &mut Axios24State, sel: Sel
         let flat_id = sel.flat_id();
         if flat_id < 42 {
             let safe = state.recall_safe_channels[flat_id];
+                if ui
+                    .button(if safe {
+                        "\u{f023} Recall Safe: ATIVO (Destravar)"
+                    } else {
+                        "\u{f09c} Recall Safe (Travar na troca de cena)"
+                    })
+                    .clicked()
+                {
+                    state.recall_safe_channels[flat_id] = !safe;
+                }
+        }
+        if group == 1 && ch < 24 {
+            let am = state.automix_channels[ch];
             if ui
-                .button(if safe {
-                    "\u{f023} Recall Safe: ATIVO (Destravar)"
+                .button(if am {
+                    "\u{f00c} Auto-Mixer (Dugan): ATIVO"
                 } else {
-                    "\u{f09c} Recall Safe (Travar na troca de cena)"
+                    "Auto-Mixer (Dugan): Adicionar"
                 })
                 .clicked()
             {
-                state.recall_safe_channels[flat_id] = !safe;
+                state.automix_channels[ch] = !am;
+                if !am {
+                    state.automix_enabled = true;
+                }
             }
         }
         if ui.button("\u{f0c5} Copiar Canal").clicked() {
