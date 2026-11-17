@@ -1,12 +1,12 @@
 [package]
 name = "axios24"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 description = "Duonn Axios 24 Digital Mixer Control Software (Modernized DS Mixer UI in Rust)"
 build = "build.rs"
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["glow", "persistence"] }
+eframe = { version = "0.31", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
 egui = { version = "0.31", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serialport = { version = "4.7", default-features = false }
