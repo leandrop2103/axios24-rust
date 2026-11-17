@@ -380,7 +380,7 @@ pub fn list_audio_input_devices() -> Vec<(u32, String)> {
 
 #[cfg(target_os = "linux")]
 mod linux_capture {
-    use super::{analyze_samples_to_rta, RtaSnapshot, FFT_SIZE};
+    use super::{compute_rta_from_pcm, RtaSnapshot, FFT_SIZE};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -428,7 +428,7 @@ mod linux_capture {
                     }
                     if buf.len() >= FFT_SIZE {
                         let start = buf.len() - FFT_SIZE;
-                        let snap = analyze_samples_to_rta(&buf[start..], sr);
+                        let snap = compute_rta_from_pcm(&buf[start..], sr);
                         if let Ok(mut g) = snap_cb.lock() {
                             *g = snap;
                         }
