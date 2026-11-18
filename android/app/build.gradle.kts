@@ -12,8 +12,8 @@ android {
         applicationId = "com.duonn.axios24"
         minSdk = 26
         targetSdk = 35
-        versionCode = 47
-        versionName = "0.4.7"
+        versionCode = 48
+        versionName = "0.4.8"
     }
 
     buildTypes {
@@ -47,4 +47,22 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     testImplementation("junit:junit:4.13.2")
+}
+
+tasks.whenTaskAdded {
+    if (name == "assembleRelease") {
+        doLast {
+            val apk = file("build/outputs/apk/release/app-release.apk")
+            if (apk.exists()) {
+                apk.copyTo(rootProject.file("../axios24_android.apk"), overwrite = true)
+            }
+        }
+    } else if (name == "assembleDebug") {
+        doLast {
+            val apk = file("build/outputs/apk/debug/app-debug.apk")
+            if (apk.exists()) {
+                apk.copyTo(rootProject.file("../axios24_android.apk"), overwrite = true)
+            }
+        }
+    }
 }
