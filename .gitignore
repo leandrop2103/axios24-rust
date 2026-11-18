@@ -1,5 +1,8 @@
 /target/
 /rea/
+/android/.gradle/
+/android/build/
+/android/app/build/
 **/*.rs.bk
 *.exe
 *.old
