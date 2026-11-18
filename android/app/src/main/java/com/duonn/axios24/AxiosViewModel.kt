@@ -141,6 +141,18 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
     }
     val channelMetersDb = mutableStateListOf<Float>().apply { repeat(60) { add(-90f) } }
     val channelClipHold = mutableStateListOf<Boolean>().apply { repeat(60) { add(false) } }
+    var lastUnknownPacketInfo by mutableStateOf("Nenhum pacote extra recebido")
+
+    fun channelMeterDb(sel: SelectedChannel): Float =
+        channelMetersDb.getOrElse(sel.flatId()) { -90f }
+
+    fun channelClipped(sel: SelectedChannel): Boolean =
+        channelClipHold.getOrElse(sel.flatId()) { false }
+
+    fun clearClipHold(sel: SelectedChannel) {
+        val id = sel.flatId()
+        if (id in 0 until channelClipHold.size) channelClipHold[id] = false
+    }
     val safeUnplugged = mutableStateListOf<Boolean>().apply { repeat(25) { add(false) } }
     private val savedFaderBeforeUnplug = FloatArray(25) { 0f }
 
@@ -169,6 +181,10 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
     private val netRunning = AtomicBoolean(false)
 
     init {
+        for (ch in 0..24) {
+            regs[AxiosProtocol.mapReg(1, ch, 0x17)] = 0x04B0
+            regs[AxiosProtocol.mapReg(1, ch, 0x18)] = 0x04B0
+        }
         loadUserPrefs()
         startMeterSimulationLoop()
         scanNetworkDevices()
@@ -322,10 +338,25 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun inputToMainLr(ch: Int): Boolean =
-        getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x17)) != 0
+        (getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x17)) and 0x3FFF) != 0
 
     fun setInputToMainLr(ch: Int, on: Boolean) {
-        setGroupParam(1, ch.coerceIn(0, 24), 0x17, if (on) 1 else 0)
+        val c = ch.coerceIn(0, 24)
+        val valLr = if (on) 0x04B0 else 0
+        setGroupParam(1, c, 0x17, valLr)
+        setGroupParam(1, c, 0x18, valLr)
+    }
+
+    fun disconnectedLrCount(): Int =
+        (0..24).count { !inputToMainLr(it) }
+
+    fun routeAllInputsToMainLr() {
+        for (ch in 0..24) {
+            setInputToMainLr(ch, true)
+        }
+        setChannelMuted(SelectedChannel.Output(8), false)
+        setChannelMuted(SelectedChannel.Output(9), false)
+        toast("Todos os canais (CH01..24 + BT/DIGI) liberados para o MAIN L&R!")
     }
 
     fun inputAuxSendDb(ch: Int, aux: Int): Float =
@@ -717,6 +748,12 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     uiTick++
                 }
+            }
+        } else if (cmd != 0x39 && cmd != 0x00) {
+            val preview = payload.take(12).joinToString(" ") { String.format("%02X", it.toInt() and 0xFF) }
+            val info = "Opcode 0x${String.format("%02X", cmd)} (${payload.size}B): $preview"
+            withContext(Dispatchers.Main) {
+                lastUnknownPacketInfo = info
             }
         }
     }

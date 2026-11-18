@@ -1,10 +1,15 @@
 package com.duonn.axios24
 
 import android.content.res.Configuration
+import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -33,6 +38,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableImmersiveFullscreen()
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
@@ -42,11 +48,41 @@ class MainActivity : ComponentActivity() {
                     surface = Color(0xFF141B29)
                 )
             ) {
-                Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF0B0F17)) {
-                    AxiosAppScreen(vm)
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = Color(0xFF0B0F17)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .safeDrawingPadding()
+                    ) {
+                        AxiosAppScreen(vm)
+                    }
                 }
             }
         }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            enableImmersiveFullscreen()
+        }
+    }
+
+    private fun enableImmersiveFullscreen() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val attrs = window.attributes
+            attrs.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            window.attributes = attrs
+        }
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
     override fun onStop() {
@@ -136,6 +172,13 @@ fun TopHeaderBar(vm: AxiosViewModel, tick: Int) {
                 active = allUnplugged,
                 activeColor = Color(0xFFE67E22),
                 onClick = { vm.toggleSafeUnplugAll() }
+            )
+            val offLr = vm.disconnectedLrCount()
+            PillChip(
+                text = if (offLr > 0) "Liberar Todos L&R ($offLr off)" else "L&R: Todos ON",
+                active = offLr == 0,
+                activeColor = if (offLr > 0) Color(0xFFF39C12) else Color(0xFF27AE60),
+                onClick = { vm.routeAllInputsToMainLr() }
             )
             if (lrMuted) {
                 PillChip(
@@ -308,6 +351,47 @@ fun QuickMasterAndBtBar(vm: AxiosViewModel, tick: Int) {
             modifier = Modifier.weight(1f).height(26.dp)
         )
         Text(formatDb(mainDb), color = Color(0xFF00E5FF), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        VuMeterBar(
+            levelDb = vm.channelMeterDb(mainLSel),
+            clipped = vm.channelClipped(mainLSel),
+            onClearClip = { vm.clearClipHold(mainLSel) },
+            segments = 10,
+            modifier = Modifier.width(66.dp).height(10.dp)
+        )
+    }
+}
+
+@Composable
+fun VuMeterBar(
+    levelDb: Float,
+    clipped: Boolean,
+    onClearClip: () -> Unit,
+    segments: Int = 18,
+    modifier: Modifier = Modifier.fillMaxWidth().height(8.dp)
+) {
+    val norm = ((levelDb + 60f) / 60f).coerceIn(0f, 1f)
+    val litCount = (norm * segments).roundToInt()
+    Row(
+        modifier = modifier.clickable(onClick = onClearClip),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        for (i in 0 until segments) {
+            val frac = (i + 1).toFloat() / segments.toFloat()
+            val lit = i < litCount
+            val segColor = when {
+                frac > 0.85f -> if (lit || (clipped && i == segments - 1)) Color(0xFFFF3B30) else Color(0xFF3A1A1A)
+                frac > 0.65f -> if (lit) Color(0xFFFFCC00) else Color(0xFF3A3318)
+                else -> if (lit) Color(0xFF2ECC71) else Color(0xFF173024)
+            }
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(segColor)
+            )
+        }
     }
 }
 
@@ -340,6 +424,15 @@ fun PortraitChannelRow(vm: AxiosViewModel, sel: SelectedChannel, tick: Int) {
                 fontSize = 13.sp,
                 modifier = Modifier.weight(1f)
             )
+            if (grp == 1 && ch <= 24) {
+                val toLr = vm.inputToMainLr(ch)
+                PillChip(
+                    text = "L&R",
+                    active = toLr,
+                    activeColor = Color(0xFF2ECC71),
+                    onClick = { vm.setInputToMainLr(ch, !toLr) }
+                )
+            }
             if (grp == 1 && ch < 24) {
                 Text(
                     text = "Gain +${vm.inputPreampGainDb(ch).roundToInt()}dB",
@@ -372,6 +465,14 @@ fun PortraitChannelRow(vm: AxiosViewModel, sel: SelectedChannel, tick: Int) {
                 onClick = { vm.setChannelMuted(sel, !muted) }
             )
         }
+        Spacer(Modifier.height(4.dp))
+        VuMeterBar(
+            levelDb = vm.channelMeterDb(sel),
+            clipped = vm.channelClipped(sel),
+            onClearClip = { vm.clearClipHold(sel) },
+            segments = 24,
+            modifier = Modifier.fillMaxWidth().height(7.dp)
+        )
         Row(verticalAlignment = Alignment.CenterVertically) {
             Slider(
                 value = faderDb.coerceIn(-90f, 10f),
@@ -429,8 +530,21 @@ fun LandscapeChannelCard(vm: AxiosViewModel, sel: SelectedChannel, tick: Int) {
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             PillChip("M", muted, Color(0xFFE74C3C)) { vm.setChannelMuted(sel, !muted) }
             PillChip("S", solo, Color(0xFFF1C40F)) { vm.setChannelSolo(sel, !solo) }
-            PillChip("0dB", false, Color(0xFF3498DB)) { vm.setEffectiveFaderDb(sel, 0f) }
+            if (grp == 1 && ch <= 24) {
+                val toLr = vm.inputToMainLr(ch)
+                PillChip("L&R", toLr, Color(0xFF2ECC71)) { vm.setInputToMainLr(ch, !toLr) }
+            } else {
+                PillChip("0dB", false, Color(0xFF3498DB)) { vm.setEffectiveFaderDb(sel, 0f) }
+            }
         }
+
+        VuMeterBar(
+            levelDb = vm.channelMeterDb(sel),
+            clipped = vm.channelClipped(sel),
+            onClearClip = { vm.clearClipHold(sel) },
+            segments = 12,
+            modifier = Modifier.fillMaxWidth().height(8.dp)
+        )
 
         Slider(
             value = faderDb.coerceIn(-90f, 10f),
@@ -663,6 +777,13 @@ fun FxAndBluetoothScreen(vm: AxiosViewModel, tick: Int) {
                     activeColor = Color(0xFF27AE60),
                     onClick = { vm.enableBluetoothPlaybackQuick() }
                 )
+                VuMeterBar(
+                    levelDb = vm.channelMeterDb(digiSel),
+                    clipped = vm.channelClipped(digiSel),
+                    onClearClip = { vm.clearClipHold(digiSel) },
+                    segments = 20,
+                    modifier = Modifier.fillMaxWidth().height(8.dp)
+                )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Volume BT/DIGI:", color = Color.White, modifier = Modifier.width(110.dp))
                     Slider(
@@ -781,6 +902,11 @@ fun ScenesAndNetworkScreen(vm: AxiosViewModel) {
                     PillChip("UDP (8086)", vm.isConnected, Color(0xFF27AE60)) { vm.connectUdp(vm.connectIp) }
                     PillChip("TCP (8087)", false, Color(0xFF2980B9)) { vm.connectTcp(vm.connectIp) }
                 }
+                Text(
+                    text = "Diagnóstico VU/Rede: ${vm.lastUnknownPacketInfo}",
+                    color = Color(0xFF94A3B8),
+                    fontSize = 11.sp
+                )
             }
         }
 
