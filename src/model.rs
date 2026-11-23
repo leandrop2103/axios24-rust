@@ -751,7 +751,12 @@ impl Axios24State {
 
     pub fn set_channel_name(&mut self, ch: SelectedChannel, name: String) {
         let id = ch.flat_id();
-        self.channel_names[id] = name;
+        self.channel_names[id] = name.clone();
+        if !matches!(self.hw_link.mode, crate::protocol::ConnectionMode::Demo) && id < 60 {
+            let mut p = vec![id as u8];
+            p.extend_from_slice(name.as_bytes());
+            self.hw_link.send_frame(crate::protocol::build_frame(0x2F, &p));
+        }
     }
 
     pub fn channel_color_idx(&self, ch: SelectedChannel) -> u8 {
@@ -951,12 +956,12 @@ impl Axios24State {
         self.set_group_param(1, ch, 0x08, v);
     }
 
-    /// +48V Phantom Power (regs 0xADF + ch, fcn.00435480)
+    /// +48V Phantom Power (param 0x01 = 0x41 + 0x3E*ch, verified in AX24E.25.11.01.001 @ 0x0043CAEE / 0x0046A8FA)
     pub fn input_phantom_48v(&self, ch: usize) -> bool {
         if ch >= 24 {
             return false;
         }
-        self.get_reg(0xADF + ch) != 0
+        self.get_reg(map_reg(1, ch, 0x01)) != 0
     }
 
     pub fn set_input_phantom_48v(&mut self, ch: usize, on: bool) {
@@ -968,30 +973,33 @@ impl Axios24State {
                     ch + 1
                 ));
             }
-            self.set_reg(0xADF + ch, if on { 1 } else { 0 });
+            self.set_reg(map_reg(1, ch, 0x01), if on { 1 } else { 0 });
         }
     }
 
-    /// Phase Invert Ø (param 0x1B, type 0x01)
+    /// Input Phase Invert Ø (param 0x09 = 0x49 + 0x3E*ch, INVERTED in AX24E @ 0x0043967B: 0 = INVERTED/Ø, 1 = NORMAL)
     pub fn input_phase_invert(&self, ch: usize) -> bool {
-        self.get_reg(map_reg(1, ch, 0x1B)) != 0
+        self.get_reg(map_reg(1, ch, 0x09)) == 0
     }
 
     pub fn set_input_phase_invert(&mut self, ch: usize, inv: bool) {
-        self.set_group_param(1, ch, 0x1B, if inv { 1 } else { 0 });
+        self.set_group_param(1, ch, 0x09, if inv { 0 } else { 1 });
     }
 
-    /// High-Z (HI-Z on CH1 and CH2, param 0x09)
+    /// High-Z (HI-Z on CH1 and CH2, param 0x00 bit 0 = 0x40 + 0x3E*ch, verified in AX24E @ 0x0043CBDD / 0x004393B6)
     pub fn input_hiz(&self, ch: usize) -> bool {
         if ch >= 2 {
             return false;
         }
-        self.get_reg(map_reg(1, ch, 0x09)) != 0
+        (self.get_reg(map_reg(1, ch, 0x00)) & 1) != 0
     }
 
     pub fn set_input_hiz(&mut self, ch: usize, on: bool) {
         if ch < 2 {
-            self.set_group_param(1, ch, 0x09, if on { 1 } else { 0 });
+            let reg = map_reg(1, ch, 0x00);
+            let cur = self.get_reg(reg) & !1;
+            let next = if on { cur | 1 } else { cur };
+            self.set_group_param(1, ch, 0x00, next);
         }
     }
 
@@ -1131,15 +1139,25 @@ impl Axios24State {
         self.set_group_param(group, ch, th_p, raw);
     }
 
-    /// Compressor Ratio (1.0 .. 20.0, type 0x0C: scale 10)
+    /// Compressor Ratio (1.0 .. 20.0, type 0x0C: AX24E 25.11 uses scale 100 @ 0x004617A9/0x0046198E; Legacy uses scale 10)
     pub fn comp_ratio(&self, group: u8, ch: usize) -> f32 {
         let (_, _, rt_p, _, _, _) = Self::comp_base(group);
-        ((self.get_reg(map_reg(group, ch, rt_p)) as f32) / 10.0).clamp(1.0, 20.0)
+        let raw = self.get_reg(map_reg(group, ch, rt_p)) as f32;
+        let ratio = if raw >= 50.0 {
+            raw / 100.0
+        } else {
+            raw / 10.0
+        };
+        ratio.clamp(1.0, 20.0)
     }
 
     pub fn set_comp_ratio(&mut self, group: u8, ch: usize, ratio: f32) {
         let (_, _, rt_p, _, _, _) = Self::comp_base(group);
-        let raw = (ratio.clamp(1.0, 20.0) * 10.0).round() as u16;
+        let scale = match self.hw_link.firmware_layout {
+            FirmwareLayout::Ax24e2511 => 100.0,
+            FirmwareLayout::Legacy => 10.0,
+        };
+        let raw = (ratio.clamp(1.0, 20.0) * scale).round() as u16;
         self.set_group_param(group, ch, rt_p, raw);
     }
 
@@ -1356,41 +1374,28 @@ impl Axios24State {
         self.set_group_param(group, ch, 0xEA, raw);
     }
 
-    /// Channel Mute (param 0xEC: bit 15 = mute in fcn.004533d0, or param 0xEB for DCA)
+    /// Channel Mute (verified in AX24E.25.11.01.001 @ 0x00466A2C / 0x004679FA / 0x00441976):
+    /// - Groups 1 (Inputs), 2 (FX), 3 (AUX/MAIN L/R): param 0xEB with INVERTED polarity: 0 = MUTED, 1 = UNMUTED (ON)
+    /// - Group 4 (DCA): param 0xD9 (reg 0xBA7/0xBCB + ch*9): 1 = MUTED (ON), 0 = UNMUTED (OFF) (@ 0x0042EF85 / 0x0042F160)
     pub fn channel_muted(&self, sel: SelectedChannel) -> bool {
         let (group, ch) = sel.group_and_index();
         if group == 4 {
-            // DCA mute is param 0xD9 (reg 0xBA7 + ch*9)
             return self.get_reg(map_reg(4, ch, 0xD9)) != 0;
         }
-        let reg = if group == 3 && ch == 8 {
-            0xA00
-        } else if group == 3 && ch == 9 {
-            0xA6E
-        } else {
-            map_reg(group, ch, 0xEC)
-        };
-        ((self.get_reg(reg) >> 15) & 1) != 0
+        self.get_reg(map_reg(group, ch, 0xEB)) == 0
     }
 
     fn set_single_channel_muted(&mut self, sel: SelectedChannel, muted: bool) {
         let (group, ch) = sel.group_and_index();
         if group == 4 {
-            self.set_group_param(4, ch, 0xD9, if muted { 1 } else { 0 });
+            self.set_reg(map_reg(4, ch, 0xD9), if muted { 1 } else { 0 });
             return;
         }
-        let reg = if group == 3 && ch == 8 {
-            0xA00
-        } else if group == 3 && ch == 9 {
-            0xA6E
-        } else {
-            map_reg(group, ch, 0xEC)
-        };
-        let cur = self.get_reg(reg) & 0x7FFF;
-        let next = if muted { cur | 0x8000 } else { cur };
-        self.set_reg(reg, next);
-        if !(group == 3 && (ch == 8 || ch == 9)) {
-            self.set_reg(reg + 1, next);
+        let val = if muted { 0 } else { 1 };
+        self.set_reg(map_reg(group, ch, 0xEB), val);
+        if group == 1 && ch == 24 {
+            // Stereo digital input (CH24 & CH25 = BT/DIGI L & R)
+            self.set_reg(map_reg(1, 25, 0xEB), val);
         }
     }
 
@@ -1447,20 +1452,50 @@ impl Axios24State {
         }
     }
 
-    /// Channel Solo (param 0xEB)
+    /// Channel Solo / PFL (param 0xEC, verified in AX24E.25.11.01.001 @ 0x00461390 & 0x004613B0)
+    /// Active when (val & 0x3FFF) != 0 && (val & 0x4000) == 0.
+    /// MAIN L uses 0xA00 (+ 0 to 0xA01), MAIN R uses 0xA6E (+ 0 to 0xA6D), all others use reg & reg+1.
     pub fn channel_solo(&self, sel: SelectedChannel) -> bool {
         let (group, ch) = sel.group_and_index();
         if group == 4 {
             return false;
         }
-        let reg = map_reg(group, ch, 0xEB);
-        self.get_reg(reg) != 0
+        let reg = if group == 3 && ch == 8 {
+            0xA00
+        } else if group == 3 && ch == 9 {
+            0xA6E
+        } else {
+            map_reg(group, ch, 0xEC)
+        };
+        let v = self.get_reg(reg);
+        (v & 0x3FFF) != 0 && (v & 0x4000) == 0
     }
 
     pub fn set_channel_solo(&mut self, sel: SelectedChannel, solo: bool) {
         let (group, ch) = sel.group_and_index();
-        if group != 4 {
-            self.set_group_param(group, ch, 0xEB, if solo { 1 } else { 0 });
+        if group == 4 {
+            return;
+        }
+        let level = if solo { 0x04B0 } else { 0 };
+        if group == 3 && ch == 8 {
+            let next = (self.get_reg(0xA00) & 0xC000) | level;
+            self.set_reg(0xA00, next);
+            self.set_reg(0xA01, 0);
+        } else if group == 3 && ch == 9 {
+            let next = (self.get_reg(0xA6E) & 0xC000) | level;
+            self.set_reg(0xA6E, next);
+            self.set_reg(0xA6D, 0);
+        } else {
+            let reg = map_reg(group, ch, 0xEC);
+            let next = (self.get_reg(reg) & 0xC000) | level;
+            self.set_reg(reg, next);
+            self.set_reg(reg + 1, next);
+            if group == 1 && ch == 24 {
+                let reg2 = map_reg(1, 25, 0xEC);
+                let next2 = (self.get_reg(reg2) & 0xC000) | level;
+                self.set_reg(reg2, next2);
+                self.set_reg(reg2 + 1, next2);
+            }
         }
     }
 
@@ -1473,22 +1508,23 @@ impl Axios24State {
     pub fn set_input_aux_send_db(&mut self, ch: usize, aux_idx: usize, db: f32) {
         let param = 0x0D + aux_idx.min(7);
         let reg = map_reg(1, ch, param);
-        let pre_post_bit = self.get_reg(reg) & 0x4000;
-        let raw = (Self::encode_fader_db(db, 0.0) & 0x3FFF) | pre_post_bit;
+        let flags = self.get_reg(reg) & 0xC000;
+        let raw = (Self::encode_fader_db(db, 0.0) & 0x3FFF) | flags;
         self.set_group_param(1, ch, param, raw);
     }
 
-    /// Input -> AUX1..8 Pre/Post fader flag (stored in bit 14 of send register, fcn.00455350)
+    /// Input -> AUX1..8 Pre/Post fader flag (verified in AX24E @ 0x004615C0..0x004615E8 & 0x0042A13D):
+    /// Bit 15 (0x8000) = 1 -> PRE-FADER, Bit 15 = 0 -> POST-FADER
     pub fn input_aux_pre_fader(&self, ch: usize, aux_idx: usize) -> bool {
         let reg = map_reg(1, ch, 0x0D + aux_idx.min(7));
-        ((self.get_reg(reg) >> 14) & 1) == 0
+        ((self.get_reg(reg) >> 15) & 1) != 0
     }
 
     pub fn set_input_aux_pre_fader(&mut self, ch: usize, aux_idx: usize, pre: bool) {
         let param = 0x0D + aux_idx.min(7);
         let reg = map_reg(1, ch, param);
         let cur = self.get_reg(reg);
-        let next = if pre { cur & !0x4000 } else { cur | 0x4000 };
+        let next = if pre { cur | 0x8000 } else { cur & !0x8000 };
         self.set_group_param(1, ch, param, next);
     }
 
@@ -1499,31 +1535,37 @@ impl Axios24State {
     }
 
     pub fn set_input_fx_send_db(&mut self, ch: usize, fx_idx: usize, db: f32) {
-        let raw = Self::encode_fader_db(db, 0.0);
-        self.set_group_param(1, ch, 0x19 + fx_idx.min(1), raw);
+        let param = 0x19 + fx_idx.min(1);
+        let flags = self.get_reg(map_reg(1, ch, param)) & 0xC000;
+        let raw = (Self::encode_fader_db(db, 0.0) & 0x3FFF) | flags;
+        self.set_group_param(1, ch, param, raw);
     }
 
-    /// Input -> Main L/R bus assignment (params 0x17 & 0x18)
+    /// Input -> Main L/R bus assignment (params 0x15 & 0x16, verified in AX24E @ 0x004277BD / 0x004278C5 & igreja.scn)
     pub fn input_to_main_lr(&self, ch: usize) -> bool {
-        let reg = map_reg(1, ch, 0x17);
-        (self.get_reg(reg) & 0x3FFF) != 0
+        let l = self.get_reg(map_reg(1, ch, 0x15)) & 0x3FFF;
+        let r = self.get_reg(map_reg(1, ch, 0x16)) & 0x3FFF;
+        l != 0 || r != 0
     }
 
     pub fn set_input_to_main_lr(&mut self, ch: usize, on: bool) {
-        let val = if on { 0x04B0 } else { 0 };
-        self.set_group_param(1, ch, 0x17, val);
-        self.set_group_param(1, ch, 0x18, val);
+        let fl_l = self.get_reg(map_reg(1, ch, 0x15)) & 0xE000;
+        let fl_r = self.get_reg(map_reg(1, ch, 0x16)) & 0xE000;
+        let level = if on { 0x04B0 } else { 0 };
+        self.set_group_param(1, ch, 0x15, fl_l | level);
+        self.set_group_param(1, ch, 0x16, fl_r | level);
     }
 
     // =========================================================================
     // OUTPUT CHANNEL PARAMETERS (Group 3: ch 0..7 = AUX1..8, 8 = MAIN L, 9 = MAIN R)
     // =========================================================================
+    /// Output Phase Invert Ø (param 0x3F = 0x68D + 0x6D*ch, INVERTED in AX24E @ 0x00441B14: 0 = INVERTED/Ø, 1 = NORMAL)
     pub fn output_phase_invert(&self, ch: usize) -> bool {
-        self.get_reg(map_reg(3, ch, 0x3F)) != 0
+        self.get_reg(map_reg(3, ch, 0x3F)) == 0
     }
 
     pub fn set_output_phase_invert(&mut self, ch: usize, inv: bool) {
-        self.set_group_param(3, ch, 0x3F, if inv { 1 } else { 0 });
+        self.set_group_param(3, ch, 0x3F, if inv { 0 } else { 1 });
     }
 
     /// Output Delay in ms (0.0 .. 40.0 ms, param 0x43, type 0x23: scale=10)
@@ -1906,8 +1948,12 @@ impl Axios24State {
             self.active_scene_idx = idx;
             self.scenes[idx] = self.regs;
             let _ = save_preset_bin(&self.preset_bin_path, &self.scenes);
-            self.hw_link.send_frame(build_scene_op_frame((idx + 1) as u8, true));
-            self.toast(format!("Cena {} ({}) salva em preset.bin!", idx + 1, self.scene_names[idx]));
+            let slot = (idx + 1) as u8;
+            let mut p10 = vec![slot];
+            p10.extend_from_slice(self.scene_names[idx].as_bytes());
+            self.hw_link.send_frame(crate::protocol::build_frame(0x10, &p10));
+            self.hw_link.send_frame(build_scene_op_frame(slot, true));
+            self.toast(format!("Cena {} ({}) salva na mesa e em preset.bin!", idx + 1, self.scene_names[idx]));
         }
     }
 
@@ -2092,11 +2138,11 @@ impl Axios24State {
         let mut regs = Vec::new();
         match group {
             1 => {
-                // Gate (0x02..=0x07), Comp (0x1B..=0x21), EQ + HPF/LPF (0x24..=0x3D)
+                // Gate (0x02..=0x07), Comp (0x1D..=0x23), EQ + HPF/LPF (0x24..=0x3D)
                 for p in 0x02..=0x07 {
                     regs.push(map_reg(1, ch, p));
                 }
-                for p in 0x1B..=0x21 {
+                for p in 0x1D..=0x23 {
                     regs.push(map_reg(1, ch, p));
                 }
                 for p in 0x24..=0x3D {
@@ -2110,8 +2156,8 @@ impl Axios24State {
                 }
             }
             3 => {
-                // Output Comp (0x46..=0x4C), EQ + HPF/LPF + 7-band PEQ (0x4D..=0x73)
-                for p in 0x46..=0x73 {
+                // Output Comp (0x44..=0x49), EQ + HPF/LPF + 7-band PEQ (0x4D..=0x73)
+                for p in 0x44..=0x73 {
                     regs.push(map_reg(3, ch, p));
                 }
             }
@@ -2576,6 +2622,36 @@ impl Axios24State {
                         }
                     }
                 }
+                NetEvent::ChannelName { ch, name } => {
+                    got_hw_packet = true;
+                    if ch < self.channel_names.len() {
+                        self.channel_names[ch] = name;
+                    }
+                }
+                NetEvent::SceneName { slot, name } => {
+                    got_hw_packet = true;
+                    if (1..=16).contains(&slot) {
+                        self.scene_names[slot - 1] = name;
+                    }
+                }
+                NetEvent::RtaLevels(bands) => {
+                    got_hw_packet = true;
+                    for (i, &b) in bands.iter().enumerate() {
+                        let db = -85.0 + (b as f32 / 100.0) * 85.0;
+                        let idx1 = (i * 2).min(self.rta_bins_db.len() - 1);
+                        let idx2 = (i * 2 + 1).min(self.rta_bins_db.len() - 1);
+                        self.rta_bins_db[idx1] = db;
+                        self.rta_bins_db[idx2] = db;
+                    }
+                    let peak_hw = bands.iter().copied().max().unwrap_or(0) as f32;
+                    let master_db = if peak_hw <= 1.0 {
+                        -90.0
+                    } else {
+                        (-60.0 + (peak_hw / 100.0) * 60.0).clamp(-90.0, 2.0)
+                    };
+                    self.channel_meters_db[36] = master_db;
+                    self.channel_meters_db[37] = master_db;
+                }
                 NetEvent::DeviceDiscovered(dev) => {
                     got_hw_packet = true;
                     if let Some(layout) = FirmwareLayout::detect(&dev.name, &dev.fw_version) {
@@ -2587,6 +2663,10 @@ impl Axios24State {
                 }
                 NetEvent::Connected(info) => {
                     got_hw_packet = true;
+                    // Stop offline demo meter animation when connected to live hardware/emulator
+                    self.demo_running = false;
+                    self.channel_meters_db = [-90.0; 60];
+                    self.rta_bins_db = [-85.0; 64];
                     self.hw_link.read_all_registers();
                     self.toast(format!("Conectado: {} (lendo cena atual da mesa...)", info));
                 }

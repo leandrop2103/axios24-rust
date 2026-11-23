@@ -635,7 +635,7 @@ fun EditChannelScreen(vm: AxiosViewModel, isLandscape: Boolean, tick: Int) {
 
                     val dly = vm.inputDelayMs(ch)
                     Text("Delay: ${String.format("%.1f ms = %.2f m", dly, dly * 0.343f)}", color = Color.White, fontSize = 12.sp)
-                    Slider(value = dly, onValueChange = { vm.setInputDelayMs(ch, it) }, valueRange = 0f..40f)
+                    Slider(value = dly, onValueChange = { vm.setInputDelayMs(ch, it) }, valueRange = 0f..10f)
                 }
             }
 
@@ -736,7 +736,7 @@ fun EqScreen(vm: AxiosViewModel, tick: Int) {
                         Text(String.format("%+.1f dB", gain), color = Color.White, fontWeight = FontWeight.Bold)
                     }
                     Text("Ganho (-15 a +15 dB)", color = Color(0xFF9AB0C8), fontSize = 11.sp)
-                    Slider(value = gain, onValueChange = { vm.setPeqBandGainDb(g, c, b, it) }, valueRange = -15f..15f)
+                    Slider(value = gain, onValueChange = { vm.setPeqBandGainDb(g, c, b, it) }, valueRange = -12f..12f)
                     Text("Frequência (20 Hz a 20 kHz)", color = Color(0xFF9AB0C8), fontSize = 11.sp)
                     Slider(value = freq, onValueChange = { vm.setPeqBandFreqHz(g, c, b, it) }, valueRange = 20f..16000f)
                 }

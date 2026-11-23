@@ -73,8 +73,9 @@ impl eframe::App for Axios24App {
         self.state.tick(dt);
         ui::render_app(ctx, &mut self.state, self.ferris_logo.as_ref());
 
-        // Continuous repaint when Demo mode, Live Audio FFT RTA, Media player, or LAN scan is active
-        if self.state.demo_running
+        // Continuous repaint when connected to hardware, Demo mode, Live Audio FFT RTA, Media player, or LAN scan is active
+        if !matches!(self.state.hw_link.mode, protocol::ConnectionMode::Demo)
+            || self.state.demo_running
             || self.state.live_rta.active
             || self.state.media.playing
             || self.state.media.recording
@@ -227,10 +228,17 @@ mod tests {
 
         // Also verify AX24E.25.11.01.001 (3518-register) .scn roundtrip and register translation
         let ax = FirmwareLayout::Ax24e2511;
-        assert_eq!(ax.to_device(map_reg(1, 0, 0xEC) as u16), 0x0057); // CH1 fader unchanged
-        assert_eq!(ax.to_device(map_reg(3, 8, 0xEC) as u16), 0x0A00); // MAIN L fader unchanged
-        assert_eq!(ax.to_device(map_reg(2, 0, 0xEC) as u16), 0x0B5F); // FX1 fader 0xB3B -> 0xB5F
-        assert_eq!(ax.to_device(map_reg(4, 0, 0xEC) as u16), 0x0BCE); // DCA1 fader 0xBAA -> 0xBCE
+        assert_eq!(ax.to_device(map_reg(1, 0, 0xEA) as u16), 0x004C); // CH1 Fader
+        assert_eq!(ax.to_device(map_reg(1, 0, 0xEB) as u16), 0x004A); // CH1 Mute (0=MUTED, 1=ON)
+        assert_eq!(ax.to_device(map_reg(1, 0, 0xEC) as u16), 0x0057); // CH1 Solo
+        assert_eq!(ax.to_device(map_reg(3, 8, 0xEA) as u16), 0x09F4); // MAIN L Fader
+        assert_eq!(ax.to_device(map_reg(3, 8, 0xEB) as u16), 0x09F6); // MAIN L Mute
+        assert_eq!(ax.to_device(map_reg(3, 8, 0xEC) as u16), 0x0A00); // MAIN L Solo
+        assert_eq!(ax.to_device(map_reg(2, 0, 0xEA) as u16), 0x0B53); // FX1 Fader 0xB2F -> 0xB53
+        assert_eq!(ax.to_device(map_reg(2, 0, 0xEB) as u16), 0x0B54); // FX1 Mute 0xB30 -> 0xB54
+        assert_eq!(ax.to_device(map_reg(2, 0, 0xEC) as u16), 0x0B5F); // FX1 Solo 0xB3B -> 0xB5F
+        assert_eq!(ax.to_device(map_reg(4, 0, 0xEA) as u16), 0x0BCC); // DCA1 Fader 0xBA8 -> 0xBCC
+        assert_eq!(ax.to_device(map_reg(4, 0, 0xD9) as u16), 0x0BCB); // DCA1 Mute 0xBA7 -> 0xBCB
         assert_eq!(ax.to_device(0x0BCC), 0x0BF0); // MAIN L/R stereo link bitmask 0xBCC -> 0xBF0
 
         let reencoded_ax24e =
@@ -482,5 +490,78 @@ mod tests {
         assert_eq!(eng.total_samples.load(std::sync::atomic::Ordering::Relaxed), 480);
         let _ = std::fs::remove_file(&wav_path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_official_ax24e_register_contract() {
+        use crate::model::{map_reg, Axios24State, SelectedChannel};
+        let mut st = Axios24State::new();
+
+        // 1. Mute uses param 0xEB with inverted polarity (0 = MUTED, 1 = UNMUTED/ON)
+        st.set_channel_muted(SelectedChannel::Input(0), true);
+        assert_eq!(st.get_reg(map_reg(1, 0, 0xEB)), 0);
+        assert!(st.channel_muted(SelectedChannel::Input(0)));
+        st.set_channel_muted(SelectedChannel::Input(0), false);
+        assert_eq!(st.get_reg(map_reg(1, 0, 0xEB)), 1);
+        assert!(!st.channel_muted(SelectedChannel::Input(0)));
+
+        // Output AUX1 & MAIN L/R Mute
+        st.set_channel_muted(SelectedChannel::Output(0), true);
+        assert_eq!(st.get_reg(map_reg(3, 0, 0xEB)), 0);
+        assert!(st.channel_muted(SelectedChannel::Output(0)));
+        st.set_channel_muted(SelectedChannel::Output(8), true);
+        assert_eq!(st.get_reg(0x09F6), 0);
+        assert_eq!(st.get_reg(0x0A63), 0); // stereo linked MAIN R
+        st.set_channel_muted(SelectedChannel::Output(8), false);
+        assert_eq!(st.get_reg(0x09F6), 1);
+
+        // 2. Solo uses param 0xEC (0x04B0 = SOLO ON, 0x0000 = OFF)
+        st.set_channel_solo(SelectedChannel::Input(0), true);
+        assert_eq!(st.get_reg(0x0057) & 0x3FFF, 0x04B0);
+        assert_eq!(st.get_reg(0x0058) & 0x3FFF, 0x04B0);
+        assert!(st.channel_solo(SelectedChannel::Input(0)));
+        st.set_channel_solo(SelectedChannel::Input(0), false);
+        assert_eq!(st.get_reg(0x0057) & 0x3FFF, 0);
+        assert!(!st.channel_solo(SelectedChannel::Input(0)));
+
+        // 3. Input -> Main L/R uses params 0x15 & 0x16 (0x0055 & 0x0056), NOT 0x17/0x18 (Solo)!
+        st.set_input_to_main_lr(0, false);
+        assert_eq!(st.get_reg(0x0055) & 0x3FFF, 0);
+        assert_eq!(st.get_reg(0x0056) & 0x3FFF, 0);
+        assert!(!st.input_to_main_lr(0));
+        st.set_input_to_main_lr(0, true);
+        assert_eq!(st.get_reg(0x0055) & 0x3FFF, 0x04B0);
+        assert_eq!(st.get_reg(0x0056) & 0x3FFF, 0x04B0);
+        assert!(st.input_to_main_lr(0));
+
+        // 4. +48V Phantom uses param 0x01 (0x0041), NOT 0xADF!
+        let old_patch = st.get_reg(0x0ADF);
+        st.set_input_phantom_48v(0, true);
+        assert_eq!(st.get_reg(0x0041), 1);
+        assert_eq!(st.get_reg(0x0ADF), old_patch);
+        assert!(st.input_phantom_48v(0));
+
+        // 5. Input Phase uses param 0x09 (0 = INVERTED, 1 = NORMAL) & Output Phase uses param 0x3F (0 = INVERTED, 1 = NORMAL)
+        assert!(!st.input_phase_invert(0));
+        st.set_input_phase_invert(0, true);
+        assert_eq!(st.get_reg(0x0049), 0);
+        assert!(st.input_phase_invert(0));
+        assert!(!st.output_phase_invert(0)); // AUX1 starts normal (0x68D == 1), NOT orange!
+        st.set_output_phase_invert(0, true);
+        assert_eq!(st.get_reg(0x068D), 0);
+        assert!(st.output_phase_invert(0));
+
+        // 6. Hi-Z uses param 0x00 bit 0 (0x0040)
+        st.set_input_hiz(0, true);
+        assert_eq!(st.get_reg(0x0040) & 1, 1);
+        assert!(st.input_hiz(0));
+
+        // 7. AUX Send Pre/Post uses bit 15 (0x8000 = PRE, 0 = POST)
+        st.set_input_aux_pre_fader(0, 0, true);
+        assert_eq!(st.get_reg(0x004D) & 0x8000, 0x8000);
+        assert!(st.input_aux_pre_fader(0, 0));
+        st.set_input_aux_pre_fader(0, 0, false);
+        assert_eq!(st.get_reg(0x004D) & 0x8000, 0);
+        assert!(!st.input_aux_pre_fader(0, 0));
     }
 }

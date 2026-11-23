@@ -478,6 +478,9 @@ pub struct DiscoveredDevice {
 #[derive(Debug)]
 pub enum NetEvent {
     ParamUpdates(Vec<(u16, u16)>),
+    ChannelName { ch: usize, name: String },
+    SceneName { slot: usize, name: String },
+    RtaLevels(Vec<u8>),
     DeviceDiscovered(DiscoveredDevice),
     Connected(String),
     Error(String),
@@ -516,34 +519,62 @@ impl HardwareLink {
         match mode {
             ConnectionMode::Udp { ip, port } => {
                 thread::spawn(move || {
-                    let bind_addr = format!("0.0.0.0:{}", UDP_LOCAL_PORT);
-                    let sock = UdpSocket::bind(&bind_addr)
-                        .or_else(|_| UdpSocket::bind("0.0.0.0:0"));
+                    let ip_clean = ip.trim().to_string();
+                    // Use ephemeral port 0.0.0.0:0 (same as probe_udp_devices which passes Windows Firewall NAT)
+                    let sock = UdpSocket::bind("0.0.0.0:0")
+                        .or_else(|_| UdpSocket::bind(format!("0.0.0.0:{}", UDP_LOCAL_PORT)));
                     match sock {
                         Ok(s) => {
                             let _ = s.set_read_timeout(Some(Duration::from_millis(20)));
                             let _ = s.set_broadcast(true);
-                            let target = format!("{}:{}", ip, port);
+                            let target = format!("{}:{}", ip_clean, port);
+                            let discover_pkt = build_frame(0x00, &[0x00]);
+                            let keepalive = build_param_read_frame(&[0]);
+                            let rta_poll = build_frame(0x46, &[0x00, 0x1F]);
+                            // Immediately send official discovery + heartbeat so mixer & firewall register this UDP session
+                            let _ = s.send_to(&discover_pkt, &target);
+                            let _ = s.send_to(&keepalive, &target);
                             let _ = tx_in.send(NetEvent::Connected(format!(
                                 "UDP {} (Keep-Alive Ativo)",
                                 target
                             )));
-                            let mut buf = [0u8; 512];
+                            let mut buf = [0u8; 2048];
                             let mut ticks: u32 = 0;
-                            let keepalive = build_kv_frame("DEVNAME=\n", false);
                             loop {
-                                while let Ok(pkt) = rx_out.try_recv() {
-                                    if pkt.is_empty() {
-                                        return;
+                                // Pace outgoing burst (max 4 packets per cycle) so real mixer Wi-Fi & Windows UDP buffers never drop packets!
+                                let mut sent_this_tick = 0usize;
+                                while sent_this_tick < 4 {
+                                    match rx_out.try_recv() {
+                                        Ok(pkt) => {
+                                            if pkt.is_empty() {
+                                                return;
+                                            }
+                                            let _ = s.send_to(&pkt, &target);
+                                            sent_this_tick += 1;
+                                        }
+                                        Err(_) => break,
                                     }
-                                    let _ = s.send_to(&pkt, &target);
                                 }
-                                if let Ok((n, src)) = s.recv_from(&mut buf) {
-                                    handle_incoming_bytes(&buf[..n], Some(src), &tx_in);
+                                // Drain all waiting incoming UDP replies immediately
+                                let _ = s.set_read_timeout(Some(Duration::from_millis(if sent_this_tick > 0 { 6 } else { 15 })));
+                                let mut got_any = false;
+                                for _ in 0..32 {
+                                    match s.recv_from(&mut buf) {
+                                        Ok((n, src)) => {
+                                            handle_incoming_bytes(&buf[..n], Some(src), &tx_in);
+                                            got_any = true;
+                                            let _ = s.set_read_timeout(Some(Duration::from_millis(1)));
+                                        }
+                                        Err(_) => break,
+                                    }
                                 }
                                 ticks = ticks.wrapping_add(1);
-                                // Send UDP heartbeat every ~2.5s (125 * 20ms) to keep Wi-Fi/Router NAT alive
-                                if ticks % 125 == 0 {
+                                // Poll live hardware VU/RTA (0x46) every ~120ms when queue is idle
+                                if sent_this_tick == 0 && !got_any && ticks % 8 == 0 {
+                                    let _ = s.send_to(&rta_poll, &target);
+                                }
+                                // Send UDP heartbeat every ~2.5s to keep Wi-Fi/Router NAT alive
+                                if ticks % 160 == 0 {
                                     let _ = s.send_to(&keepalive, &target);
                                 }
                             }
@@ -556,11 +587,12 @@ impl HardwareLink {
             }
             ConnectionMode::Tcp { ip, port } => {
                 thread::spawn(move || {
-                    let target = format!("{}:{}", ip, port);
+                    let ip_clean = ip.trim().to_string();
+                    let target = format!("{}:{}", ip_clean, port);
                     let sock_addr = target
                         .parse()
                         .unwrap_or_else(|_| SocketAddr::from(([172, 14, 10, 1], 8087)));
-                    let keepalive = build_kv_frame("DEVNAME=\n", false);
+                    let keepalive = build_kv_frame("DEVNAME=\nFW_VER=\n", false);
 
                     loop {
                         // Check if user requested disconnect before attempting connection
@@ -574,11 +606,13 @@ impl HardwareLink {
                             Ok(mut stream) => {
                                 let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
                                 let _ = stream.set_nodelay(true);
+                                let _ = stream.write_all(&keepalive);
                                 let _ = tx_in.send(NetEvent::Connected(format!(
                                     "TCP {} (Auto-Reconnect Ativo)",
                                     target
                                 )));
-                                let mut buf = [0u8; 512];
+                                let mut buf = [0u8; 2048];
+                                let mut acc: Vec<u8> = Vec::with_capacity(4096);
                                 let mut ticks: u32 = 0;
                                 let mut link_dead = false;
 
@@ -601,7 +635,39 @@ impl HardwareLink {
                                             link_dead = true;
                                         }
                                         Ok(n) => {
-                                            handle_incoming_bytes(&buf[..n], None, &tx_in);
+                                            acc.extend_from_slice(&buf[..n]);
+                                            loop {
+                                                let Some(pos) = acc.iter().position(|&b| b == 0x80) else {
+                                                    acc.clear();
+                                                    break;
+                                                };
+                                                if pos > 0 {
+                                                    acc.drain(0..pos);
+                                                }
+                                                if acc.len() < 5 {
+                                                    break;
+                                                }
+                                                let crc_off = if acc[1] == 0xFF && acc[2] == 0xFF {
+                                                    0x106
+                                                } else {
+                                                    acc[1] as usize
+                                                };
+                                                let total = crc_off + 2;
+                                                if crc_off < 3 || total > 512 {
+                                                    acc.remove(0);
+                                                    continue;
+                                                }
+                                                if acc.len() < total {
+                                                    break;
+                                                }
+                                                let frame: Vec<u8> = acc[..total].to_vec();
+                                                if parse_frame(&frame).is_some() {
+                                                    acc.drain(0..total);
+                                                    handle_incoming_bytes(&frame, None, &tx_in);
+                                                } else {
+                                                    acc.remove(0);
+                                                }
+                                            }
                                         }
                                         Err(_) => {}
                                     }
@@ -714,7 +780,7 @@ impl HardwareLink {
         }
     }
 
-    /// Requests all DSP registers from the connected mixer (opcode 0x06) so the app reflects the mixer's live scene
+    /// Requests all DSP registers (0x06), channel names (0x2E) & scene names (0x04) from the connected mixer
     pub fn read_all_registers(&self) {
         if matches!(self.mode, ConnectionMode::Demo) {
             return;
@@ -730,6 +796,14 @@ impl HardwareLink {
         if !batch.is_empty() {
             self.send_frame(build_param_read_frame(&batch));
         }
+        // Pull all 60 live channel names (opcode 0x2E)
+        for ch in 0..60u8 {
+            self.send_frame(build_frame(0x2E, &[ch]));
+        }
+        // Pull all 16 scene names (opcode 0x04)
+        for slot in 1..=16u8 {
+            self.send_frame(build_frame(0x04, &[slot]));
+        }
     }
 
     pub fn poll_events(&self) -> Vec<NetEvent> {
@@ -743,11 +817,47 @@ impl HardwareLink {
     }
 }
 
+fn parse_discovery_reply(cmd: u8, payload: &[u8]) -> Option<(String, String)> {
+    if cmd == 0x00 && payload.len() >= 5 {
+        let model = u16::from_be_bytes([payload[1], payload[2]]);
+        let raw_name = &payload[5..];
+        let end = raw_name.iter().position(|&b| b == 0).unwrap_or(raw_name.len());
+        let name_str = String::from_utf8_lossy(&raw_name[..end]).trim().to_string();
+        let name = if name_str.is_empty() || name_str.eq_ignore_ascii_case("unnamed") {
+            "AXIOS24E".to_string()
+        } else {
+            name_str
+        };
+        let fw = if model == 0xE001 {
+            "AX24E.25.11.01.001".to_string()
+        } else {
+            format!("0x{:04X}", model)
+        };
+        return Some((name, fw));
+    }
+    if cmd == 0x39 || cmd == 0x00 {
+        let text = String::from_utf8_lossy(payload);
+        let mut name = "AXIOS24".to_string();
+        let mut fw = "V1.0".to_string();
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("DEVNAME=") {
+                if !v.trim().is_empty() {
+                    name = v.trim().to_string();
+                }
+            } else if let Some(v) = line.strip_prefix("FW_VER=") {
+                fw = v.trim().to_string();
+            }
+        }
+        return Some((name, fw));
+    }
+    None
+}
+
 fn handle_incoming_bytes(data: &[u8], src: Option<SocketAddr>, tx: &Sender<NetEvent>) {
     if let Some((cmd, payload)) = parse_frame(data) {
         match cmd {
-            // Parameter write / sync response (opcodes 0x03, 0x06)
-            0x03 | 0x06 => {
+            // Parameter write ACK, read reply, and live mixer push (opcodes 0x03, 0x06, 0x25)
+            0x03 | 0x06 | 0x25 => {
                 let mut pairs = Vec::new();
                 for chunk in payload.chunks_exact(4) {
                     let reg = u16::from_be_bytes([chunk[0], chunk[1]]);
@@ -758,21 +868,41 @@ fn handle_incoming_bytes(data: &[u8], src: Option<SocketAddr>, tx: &Sender<NetEv
                     let _ = tx.send(NetEvent::ParamUpdates(pairs));
                 }
             }
-            // Discovery / KV info response (opcode 0x39 / 0x00)
-            0x39 | 0x00 => {
-                let text = String::from_utf8_lossy(payload);
-                if let Some(addr) = src {
-                    let mut name = "AXIOS24".to_string();
-                    let mut fw = "V1.0".to_string();
-                    for line in text.lines() {
-                        if let Some(v) = line.strip_prefix("DEVNAME=") {
-                            if !v.trim().is_empty() {
-                                name = v.trim().to_string();
-                            }
-                        } else if let Some(v) = line.strip_prefix("FW_VER=") {
-                            fw = v.trim().to_string();
-                        }
+            // Channel name reply (opcode 0x2E: [ch, ascii...])
+            0x2E => {
+                if let Some(&ch_b) = payload.first() {
+                    let ch = ch_b as usize;
+                    let nm = String::from_utf8_lossy(&payload[1..])
+                        .trim_matches('\0')
+                        .trim()
+                        .to_string();
+                    if ch < 60 && !nm.is_empty() {
+                        let _ = tx.send(NetEvent::ChannelName { ch, name: nm });
                     }
+                }
+            }
+            // Scene name reply (opcode 0x04: [slot_1..16, ascii...])
+            0x04 => {
+                if let Some(&slot_b) = payload.first() {
+                    let slot = slot_b as usize;
+                    let nm = String::from_utf8_lossy(&payload[1..])
+                        .trim_matches('\0')
+                        .trim()
+                        .to_string();
+                    if (1..=16).contains(&slot) && !nm.is_empty() {
+                        let _ = tx.send(NetEvent::SceneName { slot, name: nm });
+                    }
+                }
+            }
+            // Live RTA / VU telemetry reply (opcode 0x46: [start, count, b0..])
+            0x46 => {
+                if payload.len() >= 3 {
+                    let _ = tx.send(NetEvent::RtaLevels(payload[2..].to_vec()));
+                }
+            }
+            // Discovery / KV info response (opcode 0x00 binary or 0x39 KV text)
+            0x39 | 0x00 => {
+                if let (Some(addr), Some((name, fw))) = (src, parse_discovery_reply(cmd, payload)) {
                     let _ = tx.send(NetEvent::DeviceDiscovered(DiscoveredDevice {
                         name,
                         ip: addr.ip().to_string(),
@@ -802,44 +932,39 @@ pub fn detect_local_ipv4() -> Option<std::net::Ipv4Addr> {
     None
 }
 
-/// Broadcasts a UDP discovery probe on port 8086 across LAN subnet, Wi-Fi AP & all Duonn factory IPs (fcn.00426070)
+/// Broadcasts official 0x00 (`80 04 00 00 25 68`) + 0x39 UDP discovery probes on port 8086 across localhost, LAN subnet, Wi-Fi AP & factory IPs
 pub fn probe_udp_devices() -> Vec<DiscoveredDevice> {
     let mut found = Vec::new();
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
         let _ = sock.set_broadcast(true);
-        let _ = sock.set_read_timeout(Some(Duration::from_millis(280)));
-        let probe = build_kv_frame("DEVNAME=\nFW_VER=\n", false);
-        let _ = sock.send_to(&probe, ("255.255.255.255", UDP_REMOTE_PORT));
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(350)));
+        let probe_official = build_frame(0x00, &[0x00]); // Exact 80 04 00 00 25 68 from AX24E.25.11.01.001.exe
+        let probe_kv = build_kv_frame("DEVNAME=\nFW_VER=\nFW_BUILD=\n", false);
+        let mut targets: Vec<String> = vec!["127.0.0.1".to_string(), "255.255.255.255".to_string()];
         if let Some(local_ip) = detect_local_ipv4() {
+            targets.push(local_ip.to_string());
             let octets = local_ip.octets();
-            let subnet_bcast = std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 255);
-            let _ = sock.send_to(&probe, (subnet_bcast, UDP_REMOTE_PORT));
+            targets.push(format!("{}.{}.{}.255", octets[0], octets[1], octets[2]));
         }
         for &(ip, _) in &DUONN_FACTORY_IPS {
-            let _ = sock.send_to(&probe, (ip, UDP_REMOTE_PORT));
+            targets.push(ip.to_string());
+        }
+        for t in &targets {
+            let _ = sock.send_to(&probe_official, (t.as_str(), UDP_REMOTE_PORT));
+            let _ = sock.send_to(&probe_kv, (t.as_str(), UDP_REMOTE_PORT));
         }
         let mut buf = [0u8; 512];
         while let Ok((n, src)) = sock.recv_from(&mut buf) {
-            if let Some((_cmd, payload)) = parse_frame(&buf[..n]) {
-                let text = String::from_utf8_lossy(payload);
-                let mut name = "AXIOS24".to_string();
-                let mut fw = "V1.0".to_string();
-                for line in text.lines() {
-                    if let Some(v) = line.strip_prefix("DEVNAME=") {
-                        if !v.trim().is_empty() {
-                            name = v.trim().to_string();
-                        }
-                    } else if let Some(v) = line.strip_prefix("FW_VER=") {
-                        fw = v.trim().to_string();
+            if let Some((cmd, payload)) = parse_frame(&buf[..n]) {
+                if let Some((name, fw)) = parse_discovery_reply(cmd, payload) {
+                    let ip_str = src.ip().to_string();
+                    if !found.iter().any(|d: &DiscoveredDevice| d.ip == ip_str) {
+                        found.push(DiscoveredDevice {
+                            name,
+                            ip: ip_str,
+                            fw_version: fw,
+                        });
                     }
-                }
-                let ip_str = src.ip().to_string();
-                if !found.iter().any(|d: &DiscoveredDevice| d.ip == ip_str) {
-                    found.push(DiscoveredDevice {
-                        name,
-                        ip: ip_str,
-                        fw_version: fw,
-                    });
                 }
             }
         }

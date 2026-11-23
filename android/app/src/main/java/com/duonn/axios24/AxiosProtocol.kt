@@ -283,14 +283,15 @@ object AxiosProtocol {
         }
     }
 
-    /** Automatic LAN & Wi-Fi UDP discovery on port 8086 */
+    /** Automatic LAN & Wi-Fi UDP discovery on port 8086 using official 0x00 (80 04 00 00 25 68) + 0x39 probes */
     fun probeUdpDevices(): List<DiscoveredDevice> {
         val found = ArrayList<DiscoveredDevice>()
         try {
             DatagramSocket().use { sock ->
                 sock.broadcast = true
                 sock.soTimeout = 350
-                val probe = buildKvFrame("DEVNAME=\nFW_VER=\n", false)
+                val probeOfficial = buildFrame(0x00, byteArrayOf(0x00)) // Exact 80 04 00 00 25 68
+                val probeKv = buildKvFrame("DEVNAME=\nFW_VER=\nFW_BUILD=\n", false)
                 val targets = linkedSetOf("255.255.255.255")
                 detectLocalIpv4()?.let { ip ->
                     val parts = ip.split(".")
@@ -301,7 +302,8 @@ object AxiosProtocol {
                 for (t in targets) {
                     try {
                         val addr = InetAddress.getByName(t)
-                        sock.send(DatagramPacket(probe, probe.size, addr, UDP_REMOTE_PORT))
+                        sock.send(DatagramPacket(probeOfficial, probeOfficial.size, addr, UDP_REMOTE_PORT))
+                        sock.send(DatagramPacket(probeKv, probeKv.size, addr, UDP_REMOTE_PORT))
                     } catch (_: Exception) {
                     }
                 }
@@ -313,16 +315,27 @@ object AxiosProtocol {
                         val pkt = DatagramPacket(buf, buf.size)
                         sock.receive(pkt)
                         val parsed = parseFrame(pkt.data, pkt.length)
-                        if (parsed != null && (parsed.first == 0x39 || parsed.first == 0x00)) {
-                            val txt = parsed.second.toString(Charsets.UTF_8)
+                        if (parsed != null && (parsed.first == 0x00 || parsed.first == 0x39)) {
+                            val cmd = parsed.first
+                            val pl = parsed.second
                             var name = "AXIOS24"
                             var fw = "V1.0"
-                            for (line in txt.lines()) {
-                                if (line.startsWith("DEVNAME=")) {
-                                    val v = line.removePrefix("DEVNAME=").trim()
-                                    if (v.isNotEmpty()) name = v
-                                } else if (line.startsWith("FW_VER=")) {
-                                    fw = line.removePrefix("FW_VER=").trim()
+                            if (cmd == 0x00 && pl.size >= 5) {
+                                val model = ((pl[1].toInt() and 0xFF) shl 8) or (pl[2].toInt() and 0xFF)
+                                val nameBytes = pl.copyOfRange(5, pl.size)
+                                val nul = nameBytes.indexOf(0.toByte()).let { if (it >= 0) it else nameBytes.size }
+                                val parsedName = nameBytes.copyOfRange(0, nul).toString(Charsets.UTF_8).trim()
+                                name = if (parsedName.isEmpty() || parsedName.equals("unnamed", ignoreCase = true)) "AXIOS24E" else parsedName
+                                fw = if (model == 0xE001) "AX24E.25.11.01.001" else String.format("0x%04X", model)
+                            } else {
+                                val txt = pl.toString(Charsets.UTF_8)
+                                for (line in txt.lines()) {
+                                    if (line.startsWith("DEVNAME=")) {
+                                        val v = line.removePrefix("DEVNAME=").trim()
+                                        if (v.isNotEmpty()) name = v
+                                    } else if (line.startsWith("FW_VER=")) {
+                                        fw = line.removePrefix("FW_VER=").trim()
+                                    }
                                 }
                             }
                             val ip = pkt.address.hostAddress ?: continue

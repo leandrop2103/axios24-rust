@@ -181,9 +181,36 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
     private val netRunning = AtomicBoolean(false)
 
     init {
-        for (ch in 0..24) {
-            regs[AxiosProtocol.mapReg(1, ch, 0x17)] = 0x04B0
-            regs[AxiosProtocol.mapReg(1, ch, 0x18)] = 0x04B0
+        for (ch in 0..25) {
+            regs[AxiosProtocol.mapReg(1, ch, 0xEB)] = 1      // Unmuted (0=MUTED, 1=ON)
+            regs[AxiosProtocol.mapReg(1, ch, 0x09)] = 1      // Phase Normal (0=INVERTED, 1=NORMAL)
+            regs[AxiosProtocol.mapReg(1, ch, 0x0B)] = 100    // Pan Center (0..200)
+            regs[AxiosProtocol.mapReg(1, ch, 0x15)] = 0x04B0 // Routed to MAIN L
+            regs[AxiosProtocol.mapReg(1, ch, 0x16)] = 0x04B0 // Routed to MAIN R
+            regs[AxiosProtocol.mapReg(1, ch, 0x02)] = 1      // Gate enabled (threshold -80dB = 0x50)
+            regs[AxiosProtocol.mapReg(1, ch, 0x03)] = 80
+            regs[AxiosProtocol.mapReg(1, ch, 0x1D)] = 1      // Comp enabled (ratio 1.0, thresh 0dB)
+            regs[AxiosProtocol.mapReg(1, ch, 0x1E)] = 100
+            regs[AxiosProtocol.mapReg(1, ch, 0x24)] = 1      // PEQ active (not bypassed)
+            for (b in 0..3) {
+                regs[AxiosProtocol.mapReg(1, ch, 0x2A + b * 4 + 2)] = 500 // 0.0 dB
+            }
+        }
+        for (fx in 0..1) {
+            regs[AxiosProtocol.mapReg(2, fx, 0xEB)] = 1
+            regs[AxiosProtocol.mapReg(2, fx, 0xB5)] = 0x04B0
+            regs[AxiosProtocol.mapReg(2, fx, 0xB6)] = 0x04B0
+            regs[AxiosProtocol.mapReg(2, fx, 0xB9)] = 1
+        }
+        for (out in 0..9) {
+            regs[AxiosProtocol.mapReg(3, out, 0xEB)] = 1     // Unmuted (0=MUTED, 1=ON)
+            regs[AxiosProtocol.mapReg(3, out, 0x3F)] = 1     // Phase Normal (0=INVERTED, 1=NORMAL)
+            regs[AxiosProtocol.mapReg(3, out, 0x44)] = 1     // Comp active
+            regs[AxiosProtocol.mapReg(3, out, 0x45)] = 100
+            regs[AxiosProtocol.mapReg(3, out, 0x4D)] = 1     // PEQ active
+            for (b in 0..6) {
+                regs[AxiosProtocol.mapReg(3, out, 0x53 + b * 4 + 2)] = 500 // 0.0 dB
+            }
         }
         loadUserPrefs()
         startMeterSimulationLoop()
@@ -191,10 +218,10 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun defaultRegValue(idx: Int): Int {
-        // Initialize default 0dB faders on MAIN L/R (0xA00/0xA6D), stereo link on MAIN L/R (0xBCC bit 4), and reasonable defaults
+        // Initialize default 0dB faders on MAIN L/R (0x09F4/0x0A61) and stereo link on MAIN L/R (0xBCC bit 4)
         return when (idx) {
-            0xBCC -> 1 shl 4
-            0xA00, 0xA6D -> 0x04B0 // 0.0 dB on MAIN L & R
+            0x0BCC -> 1 shl 4
+            0x09F4, 0x0A61 -> 0x04B0 // 0.0 dB on MAIN L & MAIN R faders (param 0xEA)
             else -> 0
         }
     }
@@ -240,24 +267,26 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun decodeFaderDb(raw: Int): Float {
-        val v = raw.toShort().toInt()
-        val db = (v - 0x04B0) / 10f
+        val mag = raw and 0x3FFF
+        if (mag == 0) return -120f
+        val db = (mag - 0x04B0) / 10f
         return db.coerceIn(-120f, 10f)
     }
 
     fun encodeFaderDb(db: Float, maxDb: Float = 10f): Int {
+        if (db <= -119.5f) return 0
         val clamped = db.coerceIn(-120f, maxDb)
-        return ((clamped * 10f).roundToInt() + 0x04B0) and 0xFFFF
+        return ((clamped * 10f).roundToInt() + 0x04B0).coerceAtLeast(0) and 0xFFFF
     }
 
     fun channelFaderDb(sel: SelectedChannel): Float {
         val (g, c) = sel.groupAndIndex()
-        return decodeFaderDb(getReg(AxiosProtocol.mapReg(g, c, 0xEC)))
+        return decodeFaderDb(getReg(AxiosProtocol.mapReg(g, c, 0xEA)))
     }
 
     fun setChannelFaderDb(sel: SelectedChannel, db: Float) {
         val (g, c) = sel.groupAndIndex()
-        setGroupParam(g, c, 0xEC, encodeFaderDb(db, 10f))
+        setGroupParam(g, c, 0xEA, encodeFaderDb(db, 10f))
     }
 
     fun effectiveFaderDb(sel: SelectedChannel): Float = when (val sof = sendsOnFader) {
@@ -274,24 +303,76 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Channel Mute verified against AX24E.25.11.01.001.exe (@ 0x00466A2C / 0x004679FA / 0x00441976):
+     * - Groups 1 (Inputs), 2 (FX), 3 (AUX/MAIN L/R): param 0xEB INVERTED: 0 = MUTED, 1 = UNMUTED (ON)
+     * - Group 4 (DCA): param 0xD9 (0xBA7/0xBCB + ch*9): 1 = MUTED (ON), 0 = UNMUTED (OFF)
+     */
     fun channelMuted(sel: SelectedChannel): Boolean {
         val (g, c) = sel.groupAndIndex()
-        return getReg(AxiosProtocol.mapReg(g, c, 0xEA)) != 0
+        if (g == 4) {
+            return getReg(AxiosProtocol.mapReg(4, c, 0xD9)) != 0
+        }
+        return getReg(AxiosProtocol.mapReg(g, c, 0xEB)) == 0
     }
 
     fun setChannelMuted(sel: SelectedChannel, muted: Boolean) {
         val (g, c) = sel.groupAndIndex()
-        setGroupParam(g, c, 0xEA, if (muted) 1 else 0)
+        if (g == 4) {
+            setReg(AxiosProtocol.mapReg(4, c, 0xD9), if (muted) 1 else 0)
+            return
+        }
+        val v = if (muted) 0 else 1
+        setReg(AxiosProtocol.mapReg(g, c, 0xEB), v)
+        if (g == 1 && c == 24) {
+            setReg(AxiosProtocol.mapReg(1, 25, 0xEB), v)
+        } else if (g == 3 && (c == 8 || c == 9) && isOutputStereoLinked(8)) {
+            setReg(AxiosProtocol.mapReg(3, c xor 1, 0xEB), v)
+        }
     }
 
+    /**
+     * Channel Solo / PFL verified against AX24E.25.11.01.001.exe (@ 0x00461390 & 0x004613B0):
+     * param 0xEC (0xA00 MAIN L, 0xA6E MAIN R), active when (v & 0x3FFF) != 0 && (v & 0x4000) == 0.
+     */
     fun channelSolo(sel: SelectedChannel): Boolean {
         val (g, c) = sel.groupAndIndex()
-        return getReg(AxiosProtocol.mapReg(g, c, 0xEB)) != 0
+        if (g == 4) return false
+        val reg = when {
+            g == 3 && c == 8 -> 0xA00
+            g == 3 && c == 9 -> 0xA6E
+            else -> AxiosProtocol.mapReg(g, c, 0xEC)
+        }
+        val v = getReg(reg)
+        return (v and 0x3FFF) != 0 && (v and 0x4000) == 0
     }
 
     fun setChannelSolo(sel: SelectedChannel, solo: Boolean) {
         val (g, c) = sel.groupAndIndex()
-        setGroupParam(g, c, 0xEB, if (solo) 1 else 0)
+        if (g == 4) return
+        val level = if (solo) 0x04B0 else 0
+        when {
+            g == 3 && c == 8 -> {
+                setReg(0xA00, (getReg(0xA00) and 0xC000) or level)
+                setReg(0xA01, 0)
+            }
+            g == 3 && c == 9 -> {
+                setReg(0xA6E, (getReg(0xA6E) and 0xC000) or level)
+                setReg(0xA6D, 0)
+            }
+            else -> {
+                val reg = AxiosProtocol.mapReg(g, c, 0xEC)
+                val next = (getReg(reg) and 0xC000) or level
+                setReg(reg, next)
+                setReg(reg + 1, next)
+                if (g == 1 && c == 24) {
+                    val reg2 = AxiosProtocol.mapReg(1, 25, 0xEC)
+                    val next2 = (getReg(reg2) and 0xC000) or level
+                    setReg(reg2, next2)
+                    setReg(reg2 + 1, next2)
+                }
+            }
+        }
     }
 
     fun clearAllSolos() {
@@ -309,42 +390,59 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
         setGroupParam(1, ch.coerceIn(0, 24), 0x08, gainDb.roundToInt().coerceIn(0, 60))
     }
 
+    /** +48V Phantom Power (param 0x01 = 0x41 + 0x3E*ch, verified in AX24E @ 0x0043CAEE) */
     fun inputPhantom48v(ch: Int): Boolean =
-        ch in 0..23 && getReg(0xADF + ch) != 0
+        ch in 0..23 && getReg(AxiosProtocol.mapReg(1, ch, 0x01)) != 0
 
     fun setInputPhantom48v(ch: Int, on: Boolean) {
-        if (ch in 0..23) setReg(0xADF + ch, if (on) 1 else 0)
+        if (ch in 0..23) setReg(AxiosProtocol.mapReg(1, ch, 0x01), if (on) 1 else 0)
     }
 
+    /** Input Phase Invert Ø (param 0x09 INVERTED in AX24E @ 0x0043967B: 0 = INVERTED/Ø, 1 = NORMAL) */
     fun inputPhaseInvert(ch: Int): Boolean =
-        getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x09)) != 0
+        getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x09)) == 0
 
     fun setInputPhaseInvert(ch: Int, inv: Boolean) {
-        setGroupParam(1, ch.coerceIn(0, 24), 0x09, if (inv) 1 else 0)
+        setGroupParam(1, ch.coerceIn(0, 24), 0x09, if (inv) 0 else 1)
     }
 
+    /** Input Delay in ms (0.0 .. 10.0 ms, param 0x1C, scale 10) */
     fun inputDelayMs(ch: Int): Float =
-        (getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x1C)) / 10f).coerceIn(0f, 40f)
+        (getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x1C)) / 10f).coerceIn(0f, 10f)
 
     fun setInputDelayMs(ch: Int, ms: Float) {
-        setGroupParam(1, ch.coerceIn(0, 24), 0x1C, (ms.coerceIn(0f, 40f) * 10f).roundToInt())
+        setGroupParam(1, ch.coerceIn(0, 24), 0x1C, (ms.coerceIn(0f, 10f) * 10f).roundToInt())
     }
 
+    /** Pan (-100..+100, param 0x0B stored as pan + 100 where 100 = Center) */
     fun inputPan(ch: Int): Int =
-        getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x0B)).toShort().toInt().coerceIn(-100, 100)
+        (getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x0B)) - 100).coerceIn(-100, 100)
 
     fun setInputPan(ch: Int, pan: Int) {
-        setGroupParam(1, ch.coerceIn(0, 24), 0x0B, pan.coerceIn(-100, 100) and 0xFFFF)
+        setGroupParam(1, ch.coerceIn(0, 24), 0x0B, (pan.coerceIn(-100, 100) + 100))
     }
 
-    fun inputToMainLr(ch: Int): Boolean =
-        (getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x17)) and 0x3FFF) != 0
+    /** Input -> Main L/R bus assignment (params 0x15 & 0x16, verified in AX24E @ 0x004277BD / 0x004278C5) */
+    fun inputToMainLr(ch: Int): Boolean {
+        val c = ch.coerceIn(0, 24)
+        val l = getReg(AxiosProtocol.mapReg(1, c, 0x15)) and 0x3FFF
+        val r = getReg(AxiosProtocol.mapReg(1, c, 0x16)) and 0x3FFF
+        return l != 0 || r != 0
+    }
 
     fun setInputToMainLr(ch: Int, on: Boolean) {
         val c = ch.coerceIn(0, 24)
-        val valLr = if (on) 0x04B0 else 0
-        setGroupParam(1, c, 0x17, valLr)
-        setGroupParam(1, c, 0x18, valLr)
+        val flL = getReg(AxiosProtocol.mapReg(1, c, 0x15)) and 0xE000
+        val flR = getReg(AxiosProtocol.mapReg(1, c, 0x16)) and 0xE000
+        val level = if (on) 0x04B0 else 0
+        setGroupParam(1, c, 0x15, flL or level)
+        setGroupParam(1, c, 0x16, flR or level)
+        if (c == 24) {
+            val flL2 = getReg(AxiosProtocol.mapReg(1, 25, 0x15)) and 0xE000
+            val flR2 = getReg(AxiosProtocol.mapReg(1, 25, 0x16)) and 0xE000
+            setGroupParam(1, 25, 0x15, flL2 or level)
+            setGroupParam(1, 25, 0x16, flR2 or level)
+        }
     }
 
     fun disconnectedLrCount(): Int =
@@ -363,45 +461,65 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
         decodeFaderDb(getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x0D + aux.coerceIn(0, 7))))
 
     fun setInputAuxSendDb(ch: Int, aux: Int, db: Float) {
-        setGroupParam(1, ch.coerceIn(0, 24), 0x0D + aux.coerceIn(0, 7), encodeFaderDb(db, 10f))
+        val c = ch.coerceIn(0, 24)
+        val param = 0x0D + aux.coerceIn(0, 7)
+        val flags = getReg(AxiosProtocol.mapReg(1, c, param)) and 0xC000
+        setGroupParam(1, c, param, (encodeFaderDb(db, 0f) and 0x3FFF) or flags)
     }
 
     fun inputFxSendDb(ch: Int, fx: Int): Float =
         decodeFaderDb(getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x19 + fx.coerceIn(0, 1))))
 
     fun setInputFxSendDb(ch: Int, fx: Int, db: Float) {
-        setGroupParam(1, ch.coerceIn(0, 24), 0x19 + fx.coerceIn(0, 1), encodeFaderDb(db, 0f))
+        val c = ch.coerceIn(0, 24)
+        val param = 0x19 + fx.coerceIn(0, 1)
+        val flags = getReg(AxiosProtocol.mapReg(1, c, param)) and 0xC000
+        setGroupParam(1, c, param, (encodeFaderDb(db, 0f) and 0x3FFF) or flags)
     }
 
-    // Gate & Compressor
+    // Gate & Compressor (verified exact offsets & types from AX24E.25.11.01.001.exe)
     fun gateEnabled(ch: Int): Boolean = getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x02)) != 0
     fun setGateEnabled(ch: Int, on: Boolean) = setGroupParam(1, ch.coerceIn(0, 24), 0x02, if (on) 1 else 0)
-    fun gateThresholdDb(ch: Int): Float = ((getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x03)).toShort().toInt() - 0x04B0) / 10f).coerceIn(-80f, 0f)
-    fun setGateThresholdDb(ch: Int, db: Float) = setGroupParam(1, ch.coerceIn(0, 24), 0x03, ((db.coerceIn(-80f, 0f) * 10f).roundToInt() + 0x04B0) and 0xFFFF)
+    fun gateThresholdDb(ch: Int): Float {
+        val raw = getReg(AxiosProtocol.mapReg(1, ch.coerceIn(0, 24), 0x03)).toShort().toInt()
+        val db = if (raw <= 0) raw.toFloat() else (-raw).toFloat()
+        return db.coerceIn(-80f, 0f)
+    }
+    fun setGateThresholdDb(ch: Int, db: Float) {
+        val raw = (-db.coerceIn(-80f, 0f).roundToInt()).coerceIn(0, 80)
+        setGroupParam(1, ch.coerceIn(0, 24), 0x03, raw)
+    }
 
     fun compEnabled(group: Int, ch: Int): Boolean {
-        val p = if (group == 3) 0x46 else 0x1B
+        val p = if (group == 3) 0x44 else 0x1D
         return getReg(AxiosProtocol.mapReg(group, ch, p)) != 0
     }
     fun setCompEnabled(group: Int, ch: Int, on: Boolean) {
-        val p = if (group == 3) 0x46 else 0x1B
+        val p = if (group == 3) 0x44 else 0x1D
         setGroupParam(group, ch, p, if (on) 1 else 0)
     }
     fun compThresholdDb(group: Int, ch: Int): Float {
-        val p = if (group == 3) 0x47 else 0x1D
-        return ((getReg(AxiosProtocol.mapReg(group, ch, p)).toShort().toInt() - 0x04B0) / 10f).coerceIn(-60f, 0f)
+        val p = if (group == 3) 0x48 else 0x21
+        val raw = getReg(AxiosProtocol.mapReg(group, ch, p))
+        val db = if ((raw and 0x8000) != 0) -((raw and 0x7FFF) / 10f) else -(raw / 10f)
+        return db.coerceIn(-80f, 0f)
     }
     fun setCompThresholdDb(group: Int, ch: Int, db: Float) {
-        val p = if (group == 3) 0x47 else 0x1D
-        setGroupParam(group, ch, p, ((db.coerceIn(-60f, 0f) * 10f).roundToInt() + 0x04B0) and 0xFFFF)
+        val p = if (group == 3) 0x48 else 0x21
+        val mag = (-db.coerceIn(-80f, 0f) * 10f).roundToInt()
+        val raw = if (mag > 0) (mag or 0x8000) else 0
+        setGroupParam(group, ch, p, raw)
     }
     fun compRatio(group: Int, ch: Int): Float {
-        val p = if (group == 3) 0x48 else 0x1E
-        return (getReg(AxiosProtocol.mapReg(group, ch, p)) / 10f).coerceIn(1f, 20f)
+        val p = if (group == 3) 0x45 else 0x1E
+        val raw = getReg(AxiosProtocol.mapReg(group, ch, p)).toFloat()
+        val ratio = if (raw >= 50f) raw / 100f else raw / 10f
+        return ratio.coerceIn(1f, 20f)
     }
     fun setCompRatio(group: Int, ch: Int, ratio: Float) {
-        val p = if (group == 3) 0x48 else 0x1E
-        setGroupParam(group, ch, p, (ratio.coerceIn(1f, 20f) * 10f).roundToInt())
+        val p = if (group == 3) 0x45 else 0x1E
+        val scale = if (firmwareLayout == FirmwareLayout.AX24E_2511) 100f else 10f
+        setGroupParam(group, ch, p, (ratio.coerceIn(1f, 20f) * scale).roundToInt())
     }
 
     // EQ & Quick HPF 100Hz
@@ -430,12 +548,13 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
 
     fun peqBandGainDb(group: Int, ch: Int, band: Int): Float {
         val base = eqOffsets(group)[5] + band * 4
-        val raw = getReg(AxiosProtocol.mapReg(group, ch, base + 2)).toShort().toInt()
-        return ((raw - 0x04B0) / 10f).coerceIn(-15f, 15f)
+        val raw = getReg(AxiosProtocol.mapReg(group, ch, base + 2))
+        return ((raw - 500) / 10f).coerceIn(-12f, 12f)
     }
     fun setPeqBandGainDb(group: Int, ch: Int, band: Int, db: Float) {
         val base = eqOffsets(group)[5] + band * 4
-        setGroupParam(group, ch, base + 2, ((db.coerceIn(-15f, 15f) * 10f).roundToInt() + 0x04B0) and 0xFFFF)
+        val regVal = ((db.coerceIn(-12f, 12f) * 10f).roundToInt() + 500).coerceAtLeast(0)
+        setGroupParam(group, ch, base + 2, regVal)
     }
     fun peqBandFreqHz(group: Int, ch: Int, band: Int): Float {
         val base = eqOffsets(group)[5] + band * 4
@@ -567,7 +686,15 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
     fun setChannelName(sel: SelectedChannel, name: String) {
         val id = sel.flatId()
         if (id in 0 until 60) {
-            channelNames[id] = name.trim().ifEmpty { sel.shortBadge() }
+            val clean = name.trim().ifEmpty { sel.shortBadge() }
+            channelNames[id] = clean
+            if (isConnected) {
+                val nb = clean.toByteArray(Charsets.UTF_8)
+                val payload = ByteArray(1 + nb.size)
+                payload[0] = id.toByte()
+                System.arraycopy(nb, 0, payload, 1, nb.size)
+                txQueue.offer(AxiosProtocol.buildFrame(0x2F, payload))
+            }
             saveUserPrefs()
         }
     }
@@ -599,6 +726,7 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
         saveUserPrefs()
         netRunning.set(true)
         isConnected = true
+        for (i in 0 until channelMetersDb.size) channelMetersDb[i] = -90f
         connectionStatus = "UDP $connectIp:$UDP_REMOTE_PORT"
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -606,26 +734,42 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
                 DatagramSocket().use { sock ->
                     sock.soTimeout = 30
                     val addr = InetAddress.getByName(connectIp)
-                    val keepAlive = AxiosProtocol.buildKvFrame("DEVNAME=\nFW_VER=\n", false)
-                    val buf = ByteArray(512)
+                    val discoverPkt = AxiosProtocol.buildFrame(0x00, byteArrayOf(0x00))
+                    val keepAlive = AxiosProtocol.buildParamReadFrame(listOf(0))
+                    val rtaPoll = AxiosProtocol.buildFrame(0x46, byteArrayOf(0x00, 0x1F))
+                    sock.send(DatagramPacket(discoverPkt, discoverPkt.size, addr, UDP_REMOTE_PORT))
+                    sock.send(DatagramPacket(keepAlive, keepAlive.size, addr, UDP_REMOTE_PORT))
+                    val buf = ByteArray(1024)
                     var ticks = 0
 
-                    // Automatically pull current scene from mixer upon connection
+                    // Automatically pull current scene (registers + channel names + scene names) upon connection
                     readAllRegistersFromHardware()
 
                     while (netRunning.get()) {
-                        while (true) {
+                        var sentNow = 0
+                        while (sentNow < 4) {
                             val pkt = txQueue.poll() ?: break
                             sock.send(DatagramPacket(pkt, pkt.size, addr, UDP_REMOTE_PORT))
+                            sentNow++
                         }
-                        try {
-                            val rx = DatagramPacket(buf, buf.size)
-                            sock.receive(rx)
-                            handleIncomingPacket(rx.data, rx.length)
-                        } catch (_: Exception) {
+                        sock.soTimeout = if (sentNow > 0) 8 else 18
+                        var gotAny = false
+                        for (i in 0 until 24) {
+                            try {
+                                val rx = DatagramPacket(buf, buf.size)
+                                sock.receive(rx)
+                                handleIncomingPacket(rx.data, rx.length)
+                                gotAny = true
+                                sock.soTimeout = 2
+                            } catch (_: Exception) {
+                                break
+                            }
                         }
                         ticks++
-                        if (ticks % 80 == 0) {
+                        if (sentNow == 0 && !gotAny && ticks % 6 == 0) {
+                            sock.send(DatagramPacket(rtaPoll, rtaPoll.size, addr, UDP_REMOTE_PORT))
+                        }
+                        if (ticks % 120 == 0) {
                             sock.send(DatagramPacket(keepAlive, keepAlive.size, addr, UDP_REMOTE_PORT))
                         }
                     }
@@ -645,6 +789,7 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
         saveUserPrefs()
         netRunning.set(true)
         isConnected = true
+        for (i in 0 until channelMetersDb.size) channelMetersDb[i] = -90f
         connectionStatus = "TCP $connectIp:$TCP_REMOTE_PORT"
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -704,6 +849,12 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
         if (batch.isNotEmpty()) {
             txQueue.offer(AxiosProtocol.buildParamReadFrame(batch))
         }
+        for (ch in 0 until 60) {
+            txQueue.offer(AxiosProtocol.buildFrame(0x2E, byteArrayOf(ch.toByte())))
+        }
+        for (slot in 1..16) {
+            txQueue.offer(AxiosProtocol.buildFrame(0x04, byteArrayOf(slot.toByte())))
+        }
     }
 
     fun syncAllRegistersToHardware() {
@@ -728,7 +879,7 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun handleIncomingPacket(data: ByteArray, length: Int) {
         val parsed = AxiosProtocol.parseFrame(data, length) ?: return
         val (cmd, payload) = parsed
-        if (cmd == 0x03 || cmd == 0x06) {
+        if (cmd == 0x03 || cmd == 0x06 || cmd == 0x25) {
             val updates = ArrayList<Pair<Int, Int>>()
             var i = 0
             while (i + 4 <= payload.size) {
@@ -748,6 +899,31 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     uiTick++
                 }
+            }
+        } else if (cmd == 0x2E && payload.isNotEmpty()) {
+            val ch = payload[0].toInt() and 0xFF
+            val nm = payload.copyOfRange(1, payload.size).toString(Charsets.UTF_8).trim('\u0000', ' ')
+            if (ch in 0 until channelNames.size && nm.isNotEmpty()) {
+                withContext(Dispatchers.Main) {
+                    channelNames[ch] = nm
+                    uiTick++
+                }
+            }
+        } else if (cmd == 0x04 && payload.isNotEmpty()) {
+            val slot = payload[0].toInt() and 0xFF
+            val nm = payload.copyOfRange(1, payload.size).toString(Charsets.UTF_8).trim('\u0000', ' ')
+            if (slot in 1..16 && nm.isNotEmpty()) {
+                withContext(Dispatchers.Main) {
+                    sceneNames[slot - 1] = nm
+                    uiTick++
+                }
+            }
+        } else if (cmd == 0x46 && payload.size >= 3) {
+            val peak = payload.drop(2).maxOfOrNull { it.toInt() and 0xFF } ?: 0
+            val masterDb = if (peak <= 1) -90f else (-60f + (peak / 100f) * 60f).coerceIn(-90f, 2f)
+            withContext(Dispatchers.Main) {
+                channelMetersDb[36] = masterDb
+                channelMetersDb[37] = masterDb
             }
         } else if (cmd != 0x39 && cmd != 0x00) {
             val preview = payload.take(12).joinToString(" ") { String.format("%02X", it.toInt() and 0xFF) }

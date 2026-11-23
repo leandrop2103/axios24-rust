@@ -1494,11 +1494,6 @@ fn channels_for_layer(layer: FaderLayer) -> Vec<SelectedChannel> {
             SelectedChannel::Input(24),
             SelectedChannel::Fx(0),
             SelectedChannel::Fx(1),
-            SelectedChannel::Output(0),
-            SelectedChannel::Output(1),
-            SelectedChannel::Output(2),
-            SelectedChannel::Output(3),
-            SelectedChannel::Dca(0),
         ],
         FaderLayer::Aux1_8 => (0..8).map(SelectedChannel::Output).collect(),
         FaderLayer::Dca1_4 => vec![
@@ -3457,7 +3452,8 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
     match state.settings_tab {
         SettingsSubTab::Scene => {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("Gerenciador de Cenas (16 Cenas em preset.bin + Importar/Exportar .scn)");
+                ui.heading("Gerenciador de Cenas (16 Cenas — Mesa + preset.bin + .scn)");
+                ui.add_space(8.0);
                 if ui.button("\u{f019} Importar Cena (.scn)").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Axios24 Scene", &["scn"])
@@ -3475,58 +3471,166 @@ fn render_settings_page(ui: &mut Ui, state: &mut Axios24State) {
                         state.export_scn_file(&path);
                     }
                 }
+                if !matches!(state.hw_link.mode, crate::protocol::ConnectionMode::Demo)
+                    && ui.button("\u{f021} Ler Cenas da Mesa").clicked()
+                {
+                    state.hw_link.read_all_registers();
+                    state.toast("Lendo cenas e nomes diretamente da mesa...");
+                }
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
 
-            let card_w = ((ui.available_width() - 30.0) / 4.0).clamp(180.0, 280.0);
-            egui::Grid::new("scenes_grid")
-                .num_columns(4)
-                .spacing([8.0, 8.0])
-                .striped(true)
+            egui::ScrollArea::vertical()
+                .id_salt("scenes_grid_scroll")
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for s in 0..16 {
-                        let is_act = state.active_scene_idx == s;
-                        Frame::NONE
-                            .fill(if is_act {
-                                Color32::from_rgb(22, 42, 62)
-                            } else {
-                                Color32::from_rgb(16, 22, 32)
-                            })
-                            .corner_radius(CornerRadius::same(6))
-                            .inner_margin(Margin::same(8))
-                            .stroke(Stroke::new(
-                                1.0_f32,
-                                if is_act {
-                                    Color32::from_rgb(0, 220, 255)
-                                } else {
-                                    Color32::from_rgb(40, 52, 70)
-                                },
-                            ))
-                            .show(ui, |ui| {
-                                ui.set_width(card_w - 16.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("#{:02}", s + 1))
-                                            .strong()
-                                            .color(Color32::from_rgb(0, 215, 255)),
-                                    );
-                                    ui.text_edit_singleline(&mut state.scene_names[s]);
-                                });
-                                ui.horizontal(|ui| {
-                                    if ui.button("\u{f04b} Call").clicked() {
-                                        state.recall_scene(s);
-                                    }
-                                    if ui.button("\u{f0c7} Save").clicked() {
-                                        state.save_scene(s);
-                                    }
-                                    if ui.button("\u{f021} Padrão").clicked() {
-                                        state.reset_scene_to_default(s);
-                                    }
-                                });
-                            });
-                        if (s + 1) % 4 == 0 {
-                            ui.end_row();
-                        }
+                    let avail_w = (ui.available_width() - 4.0).max(420.0);
+                    let avail_h = ui.available_height().max(360.0);
+                    let cols: usize = if avail_w >= 860.0 { 4 } else { 2 };
+                    let rows: usize = 16 / cols;
+                    let gap = 10.0_f32;
+                    let card_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).floor().max(195.0);
+                    let card_h = ((avail_h - gap * (rows as f32 - 1.0) - 4.0) / rows as f32)
+                        .floor()
+                        .clamp(92.0, 148.0);
+                    let pad = 10.0_f32;
+                    let inner_w = (card_w - pad * 2.0 - 2.0).max(160.0);
+                    let inner_h = (card_h - pad * 2.0 - 2.0).max(70.0);
+
+                    ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
+                    for r in 0..rows {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for c in 0..cols {
+                                let s = r * cols + c;
+                                let is_act = state.active_scene_idx == s;
+                                Frame::NONE
+                                    .fill(if is_act {
+                                        Color32::from_rgb(18, 44, 66)
+                                    } else {
+                                        Color32::from_rgb(16, 22, 32)
+                                    })
+                                    .corner_radius(CornerRadius::same(8))
+                                    .inner_margin(Margin::same(pad as i8))
+                                    .stroke(Stroke::new(
+                                        if is_act { 1.8_f32 } else { 1.0_f32 },
+                                        if is_act {
+                                            Color32::from_rgb(0, 220, 255)
+                                        } else {
+                                            Color32::from_rgb(42, 56, 76)
+                                        },
+                                    ))
+                                    .show(ui, |ui| {
+                                        ui.set_min_size(Vec2::new(inner_w, inner_h));
+                                        ui.set_max_size(Vec2::new(inner_w, inner_h));
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 6.0;
+
+                                            // Top badge row: slot number + active status pill
+                                            ui.horizontal(|ui| {
+                                                Frame::NONE
+                                                    .fill(if is_act {
+                                                        Color32::from_rgb(0, 175, 220)
+                                                    } else {
+                                                        Color32::from_rgb(28, 38, 54)
+                                                    })
+                                                    .corner_radius(CornerRadius::same(4))
+                                                    .inner_margin(Margin::symmetric(6, 2))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            RichText::new(format!("#{:02}", s + 1))
+                                                                .strong()
+                                                                .size(12.5)
+                                                                .color(if is_act {
+                                                                    Color32::from_rgb(8, 16, 24)
+                                                                } else {
+                                                                    Color32::from_rgb(0, 215, 255)
+                                                                }),
+                                                        );
+                                                    });
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        if is_act {
+                                                            ui.label(
+                                                                RichText::new("● ATIVA")
+                                                                    .strong()
+                                                                    .size(11.0)
+                                                                    .color(Color32::from_rgb(56, 232, 160)),
+                                                            );
+                                                        } else {
+                                                            ui.label(
+                                                                RichText::new(format!("Cena {}", s + 1))
+                                                                    .size(10.5)
+                                                                    .color(Color32::from_rgb(115, 130, 152)),
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                            });
+
+                                            // Full-width scene name input
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.scene_names[s])
+                                                    .desired_width(inner_w)
+                                                    .margin(Vec2::new(6.0, 5.0)),
+                                            );
+
+                                            // Push action buttons neatly to bottom of card
+                                            let rem_h = (ui.available_height() - 28.0).max(0.0);
+                                            if rem_h > 0.0 {
+                                                ui.add_space(rem_h);
+                                            }
+
+                                            // 3 equal-width action buttons filling 100% of card width
+                                            let btn_gap = 6.0_f32;
+                                            let btn_w = ((inner_w - btn_gap * 2.0) / 3.0).floor().max(48.0);
+                                            let btn_h = 26.0_f32;
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = btn_gap;
+                                                let call_btn = egui::Button::new(
+                                                    RichText::new("\u{f04b} Call")
+                                                        .strong()
+                                                        .size(11.5)
+                                                        .color(Color32::WHITE),
+                                                )
+                                                .fill(if is_act {
+                                                    Color32::from_rgb(0, 145, 200)
+                                                } else {
+                                                    Color32::from_rgb(30, 52, 78)
+                                                })
+                                                .min_size(Vec2::new(btn_w, btn_h));
+                                                if ui.add(call_btn).clicked() {
+                                                    state.recall_scene(s);
+                                                }
+
+                                                let save_btn = egui::Button::new(
+                                                    RichText::new("\u{f0c7} Save")
+                                                        .strong()
+                                                        .size(11.5)
+                                                        .color(Color32::WHITE),
+                                                )
+                                                .fill(Color32::from_rgb(24, 108, 72))
+                                                .min_size(Vec2::new(btn_w, btn_h));
+                                                if ui.add(save_btn).clicked() {
+                                                    state.save_scene(s);
+                                                }
+
+                                                let rst_btn = egui::Button::new(
+                                                    RichText::new("\u{f021} Padrão")
+                                                        .size(11.0)
+                                                        .color(Color32::from_rgb(210, 218, 230)),
+                                                )
+                                                .fill(Color32::from_rgb(42, 48, 60))
+                                                .min_size(Vec2::new(btn_w, btn_h));
+                                                if ui.add(rst_btn).clicked() {
+                                                    state.reset_scene_to_default(s);
+                                                }
+                                            });
+                                        });
+                                    });
+                            }
+                        });
                     }
                 });
         }
@@ -4562,11 +4666,13 @@ fn render_connect_modal(ctx: &egui::Context, state: &mut Axios24State) {
                                     )
                                     .clicked()
                                 {
-                                    state.connect_ip = dev.ip.clone();
+                                    state.connect_ip = dev.ip.trim().to_string();
                                     state.hw_link.connect(ConnectionMode::Udp {
-                                        ip: dev.ip.clone(),
+                                        ip: state.connect_ip.clone(),
                                         port: UDP_REMOTE_PORT,
                                     });
+                                    state.last_net_rx_time = state.sim_time;
+                                    state.net_link_lost = false;
                                     state.demo_running = false;
                                     state.show_connect_modal = false;
                                 }
@@ -4659,11 +4765,14 @@ fn render_connect_modal(ctx: &egui::Context, state: &mut Axios24State) {
                 )
                 .clicked()
             {
-                let ip = state.connect_ip.clone();
+                let ip = state.connect_ip.trim().to_string();
+                state.connect_ip = ip.clone();
                 state.hw_link.connect(ConnectionMode::Udp {
                     ip,
                     port: UDP_REMOTE_PORT,
                 });
+                state.last_net_rx_time = state.sim_time;
+                state.net_link_lost = false;
                 state.demo_running = false;
                 state.show_connect_modal = false;
             }
@@ -4674,11 +4783,14 @@ fn render_connect_modal(ctx: &egui::Context, state: &mut Axios24State) {
                 )
                 .clicked()
             {
-                let ip = state.connect_ip.clone();
+                let ip = state.connect_ip.trim().to_string();
+                state.connect_ip = ip.clone();
                 state.hw_link.connect(ConnectionMode::Tcp {
                     ip,
                     port: TCP_REMOTE_PORT,
                 });
+                state.last_net_rx_time = state.sim_time;
+                state.net_link_lost = false;
                 state.demo_running = false;
                 state.show_connect_modal = false;
             }

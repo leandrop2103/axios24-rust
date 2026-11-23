@@ -19,11 +19,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
       - run: cargo build --release
-      - run: Copy-Item target\release\axios24.exe axios24_rust.exe
+      - run: |
+          Copy-Item target\release\axios24.exe axios24_rust.exe
+          Copy-Item target\release\axios24_emulator.exe axios24_emulator.exe
       - uses: actions/upload-artifact@v4
         with:
           name: axios24-windows-x86_64
-          path: axios24_rust.exe
+          path: |
+            axios24_rust.exe
+            axios24_emulator.exe
 
   build-linux:
     runs-on: ubuntu-24.04
@@ -79,5 +83,6 @@ jobs:
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
           files: |
             artifacts/axios24-windows-x86_64/axios24_rust.exe
+            artifacts/axios24-windows-x86_64/axios24_emulator.exe
             artifacts/axios24-linux-x86_64/axios24_linux_x86_64
             artifacts/axios24-android-apk/axios24_android.apk

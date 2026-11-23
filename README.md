@@ -1,6 +1,6 @@
-# Duonn Axios 24 — DS Mixer Pro (Rust Edition) `v0.2.4`
+# Duonn Axios 24 — DS Mixer Pro (Rust Edition & Android) `v0.4.8`
 
-Interface moderna, leve (~2,5 MB) e de código aberto em **Rust** para controle remoto da mesa de som digital **Duonn Axios 24** (via Rede LAN/Wi-Fi UDP/TCP ou USB Serial), com visual inspirado no **DS Mixer**, curvas de EQ/Gate/Compressor em tempo real, Analisador de Espectro **RTA FFT Real**, suporte completo a cenas oficiais `.scn` e **Auto-Update a quente via GitHub**.
+Interface moderna, ultra-leve (~2,5 MB) e de código aberto em **Rust** (Windows / Linux) e **Android Nativo** (Kotlin + Jetpack Compose) para controle remoto da mesa de som digital **Duonn Axios 24** (via Rede LAN/Wi-Fi UDP/TCP ou USB Serial), com visual inspirado no **DS Mixer**, curvas de EQ/Gate/Compressor em tempo real, Analisador de Espectro **RTA FFT Real**, suporte completo a cenas oficiais `.scn`, **Emulador de Hardware Virtual Integrado** e **Auto-Update a quente via GitHub**.
 
 > **Projeto Vibecodado** — Desenvolvido de forma colaborativa via *vibecoding*!  
 > **Autores**: **Leandro Pinheiro** ([@leandrop2103](https://github.com/leandrop2103)) & **Antigravity** (Google Deepmind AI)  
@@ -82,6 +82,55 @@ Instale o **Rust** via [rustup.rs](https://rustup.rs/).
 
 *(No Linux, o áudio do Multitrack, o RTA FFT e o MIDI USB funcionam nativamente via ALSA / PipeWire através de `cpal` e `midir`.)*
 
+### 4. Compilar o Emulador de Hardware Virtual (Windows / Linux)
+Para compilar e executar o emulador de bancada para testes offline:
+```powershell
+cargo run --release --bin axios24_emulator
+# ou apenas compilar:
+cargo build --release --bin axios24_emulator
+```
+O executável otimizado será gerado em:
+```text
+target\release\axios24_emulator.exe
+```
+
+### 5. Compilar o App Android (Kotlin + Jetpack Compose)
+1. Certifique-se de ter o **JDK 17** e o **Android SDK** configurados.
+2. Na raiz do projeto, acesse a pasta `android` e execute:
+```bash
+cd android
+./gradlew assembleRelease
+```
+O APK final assinado será gerado em:
+```text
+android/app/build/outputs/apk/release/app-release.apk
+```
+
+---
+
+## Emulador de Hardware Virtual (`axios24_emulator`)
+
+O repositório inclui um **Emulador de Hardware Virtual** de alta fidelidade desenvolvido em Rust puro. Ele permite desenvolver, depurar e testar tanto os nossos aplicativos (Desktop Rust e Android) quanto o próprio software oficial do fabricante, sem necessidade de estar fisicamente conectado à mesa de som.
+
+### Recursos do Emulador:
+- **Rede e Protocolos em Tempo Real**:
+  - Escuta simultaneamente na porta **UDP 8086** (com respostas broadcast e unicast para a porta local padrão **1080**) e **TCP 8087**.
+  - Suporte opcional a bridge via porta serial COM virtual (ex.: `com0com`).
+  - Responde ao comando oficial de auto-descoberta (`0x1F` / `0x20` / `0x21`) identificando-se como `AX24E-EMU` com firmware `AX24E.25.11.01.001`.
+- **Layout Visual de Bancada**:
+  - **70% à esquerda**: 24 bolinhas de canais de entrada (`CH 1..24`).
+    - **Verde**: Canal ativo / desmutado.
+    - **Vermelho**: Canal mutado.
+    - **Anel Amarelo**: Canal em Solo.
+    - **Halo Pulsante e Nível**: Indicação visual imediata do fader e VU.
+  - **30% à direita**: 2 bolinhas de destaque para `MASTER L` e `MASTER R` com medição VU estéreo ao vivo em barra graduada.
+  - **Rodapé**: Barra horizontal com 8 bolinhas dedicadas aos canais auxiliares (`AUX 1..8`).
+- **Banco de 16 Cenas Integrado**:
+  - Gerenciamento completo de 16 cenas persistentes em arquivo local (`emulator_scenes.bin`).
+  - Suporta operações de recall de cena (`0x0A`) e salvamento de cena (`0x0B`), preservando nomes de canais, volumes, mutes, envios L/R e equalizações.
+- **Sincronização Multi-Cliente**:
+  - Qualquer fader, botão de mudo ou solo acionado no software em Rust, no app Android ou no software oficial da mesa atualiza o emulador instantaneamente e é propagado via broadcast (`0x25`) para os demais dispositivos conectados na rede local.
+
 ---
 
 ## Como Usar
@@ -143,4 +192,5 @@ Você também pode consultar esta lista dentro do aplicativo em **`CONFIG / CENA
 
 Este projeto é uma reimplementação **independente e não oficial** em código aberto (licença **MIT**) desenvolvida com foco em **interoperabilidade** para proprietários do hardware Duonn Axios 24.  
 - Nenhum binário proprietário, código-fonte original ou marca registrada da fabricante é redistribuído neste repositório.  
+- O emulador de hardware virtual (`axios24_emulator`) é uma implementação original "clean-room" em Rust baseada em comunicação de rede (UDP/TCP), atuando estritamente em conformidade com as normas de interoperabilidade e termos do GitHub.  
 - "Duonn" e "Axios 24" são marcas registradas de seus respectivos proprietários, citadas apenas para fins de compatibilidade de hardware.
