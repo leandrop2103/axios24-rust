@@ -1,53 +1,57 @@
+<p align="right">
+  <strong>English</strong> • <a href="README.pt-BR.md">🇧🇷 Versão em Português (pt-BR)</a>
+</p>
+
 # Duonn Axios 24 — DS Mixer Pro (Rust Edition & Android) `v0.4.8`
 
-Interface moderna, ultra-leve (~2,5 MB) e de código aberto em **Rust** (Windows / Linux) e **Android Nativo** (Kotlin + Jetpack Compose) para controle remoto da mesa de som digital **Duonn Axios 24** (via Rede LAN/Wi-Fi UDP/TCP ou USB Serial), com visual inspirado no **DS Mixer**, curvas de EQ/Gate/Compressor em tempo real, Analisador de Espectro **RTA FFT Real**, suporte completo a cenas oficiais `.scn`, **Emulador de Hardware Virtual Integrado** e **Auto-Update a quente via GitHub**.
+Modern, ultra-lightweight (~2.5 MB), open-source **Rust** (Windows / Linux) and **Native Android** (Kotlin + Jetpack Compose) remote control suite for the **Duonn Axios 24** digital audio mixing console (via LAN/Wi-Fi UDP/TCP or USB Serial). Features a sleek user interface inspired by **DS Mixer**, real-time EQ/Gate/Compressor curves, **Real FFT RTA Spectrum Analyzer**, 100% compatible official `.scn` scene management, an **Integrated Virtual Hardware Emulator**, and **GitHub hot auto-updates**.
 
-> **Projeto Vibecodado** — Desenvolvido de forma colaborativa via *vibecoding*!  
-> **Autores**: **Leandro Pinheiro** ([@leandrop2103](https://github.com/leandrop2103)) & **Antigravity** (Google Deepmind AI)  
-> **Licença**: [MIT](LICENSE)
-
----
-
-## Principais Recursos
-
-- **Conexão Automática & Multi-Protocolo**:
-  - Busca automática na rede interna (LAN) e nos IPs Wi-Fi/fábrica da mesa (`172.14.10.1`, `192.168.4.1`, `172.14.11.1`, `172.14.30.1`) na porta **UDP 8086**.
-  - Suporte a **UDP (8086)**, **TCP (8087)**, **USB Serial (115200 bps)** e **Modo Demo Offline** com simulador de áudio e medidores.
-- **Interface Moderna & Personalizável**:
-  - **Modo Normal**, **Modo Analógico** e **Big Desktop** com `MAIN L & R` sempre fixos na lateral direita.
-  - **Tema Escuro (Dark) e Claro (Light)** alternável em `CONFIG / CENAS > SISTEMA` ou tecla `F11`.
-  - **Nome em cima e Canal em baixo** em cada strip, com duplo clique para renomear inline e **32 cores** personalizáveis por canal.
-- **Recursos Profissionais de Mixagem**:
-  - **Sends on Fader** (`MAIN L/R`, `AUX 1..8`, `FX 1..2`) com botão **`PRE FADER` / `POST FADER`** direto no canal.
-  - **PEQ Paramétrico de 4/7 bandas + HPF/LPF** com gráfico interativo de resposta em frequência (biquads DSP reais).
-  - **RTA FFT Real** de 2048 pontos via placa de som / interface USB (`WinMM` no Windows) + detecção de pico de frequência e **Notch Anti-Microfonia**.
-  - **Gate & Compressor** com curvas gráficas interativas.
-  - **Importação e Exportação de Cenas `.scn`** 100% compatível com o formato oficial da Axios 24 (incluindo nomes dos canais e todos os 3.413 registradores) + banco de 16 cenas (`preset.bin`).
-  - **Proteções & Correções**: Correção rápida de envio `L/R`, Modo **Desplugar Cabo** (silencia sem estalo), proteção anti-estalo `+48V`, **Auto-Gain (-18 dBFS)**, 12 Presets de Canal, 4 Grupos de Mute, 4 Grupos +48V, Macros Live (Stream Deck).
-- **Auto-Update a Quente (GitHub Releases)**:
-  - Ao abrir o programa (ou em `CONFIG / CENAS > SISTEMA`), verifica automaticamente se há nova versão no GitHub, exibe o resumo das novidades e permite atualizar com 1 clique reiniciando automaticamente.
+> **Vibecoded Project** — Collaboratively developed via *vibecoding*!  
+> **Authors**: **Leandro Pinheiro** ([@leandrop2103](https://github.com/leandrop2103)) & **Antigravity** (Google Deepmind AI)  
+> **License**: [MIT](LICENSE)
 
 ---
 
-## Como Compilar
+## Key Features
 
-### 1. Pré-requisitos (Windows e Linux)
-Instale o **Rust** via [rustup.rs](https://rustup.rs/).
+- **Automatic Connection & Multi-Protocol**:
+  - Auto-discovery across local network (LAN) and factory/Wi-Fi IPs (`172.14.10.1`, `192.168.4.1`, `172.14.11.1`, `172.14.30.1`) on **UDP 8086**.
+  - Supports **UDP (8086)**, **TCP (8087)**, **USB Serial (115200 bps)**, and **Offline Demo Mode** with audio and meter simulation.
+- **Modern & Customizable UI**:
+  - **Normal Mode**, **Analog Mode**, and **Big Desktop** layout with persistent `MAIN L & R` master strip pinned on the right.
+  - **Dark and Light Themes**, switchable via `CONFIG / SCENES > SYSTEM` or `F11`.
+  - **Name on top and Channel badge at the bottom** on each strip, with double-click inline renaming and **32 customizable colors** per channel.
+- **Professional Mixing Capabilities**:
+  - **Sends on Fader** (`MAIN L/R`, `AUX 1..8`, `FX 1..2`) with dedicated **`PRE FADER` / `POST FADER`** toggle directly on each channel strip.
+  - **4/7-band Parametric EQ + HPF/LPF** with interactive frequency response curves (real DSP biquad filter calculations).
+  - **2048-point Real FFT RTA** via soundcard / USB audio interface (`WinMM` on Windows, ALSA on Linux) with peak frequency detection and **Anti-Feedback Notch Filter**.
+  - **Interactive Gate & Compressor graphs** with live threshold and gain reduction visualization.
+  - **Scene Import & Export (`.scn`)**: 100% binary compatibility with the official Axios 24 software format (including channel names and all 3,413 DSP registers) + 16-scene onboard storage (`preset.bin`).
+  - **Safety & Audio Tools**: Fast L/R routing restore, **Unplug Cable Safe Mode** (click-free muting), `+48V` anti-pop protection, **Auto-Gain (-18 dBFS)**, 12 Channel Presets, 4 Mute Groups, 4 +48V Groups, and Live Stream Deck Macros.
+- **Hot Auto-Update (GitHub Releases)**:
+  - Automatically checks for updates on startup or in `CONFIG / SCENES > SYSTEM`, displays release notes, and updates in 1 click by seamlessly relaunching the application.
 
-### 2. Compilar no Windows
-1. Instale o **Visual Studio Build Tools** (carga de trabalho *"Desenvolvimento para desktop com C++"* / MSVC + Windows SDK).
-2. Abra o PowerShell ou terminal na pasta do projeto e execute:
+---
+
+## How to Build
+
+### 1. Prerequisites (Windows and Linux)
+Install **Rust** via [rustup.rs](https://rustup.rs/).
+
+### 2. Build on Windows
+1. Install **Visual Studio Build Tools** (select *"Desktop development with C++"* / MSVC + Windows SDK).
+2. Open PowerShell or a terminal in the project directory and run:
    ```powershell
    cargo test
    cargo build --release
    ```
-3. O executável otimizado (~2,5 MB, já com o ícone do Ferris embutido) será gerado em:
+3. The optimized executable (~2.5 MB, with Ferris mixer icon embedded) will be generated at:
    ```text
    target\release\axios24.exe
    ```
 
-### 3. Compilar no Linux (Ubuntu / Debian / Arch / Fedora)
-1. Instale as dependências de sistema para janela OpenGL (`eframe`/`winit`), diálogo de arquivos (`rfd` via GTK3) e porta serial (`serialport` via `libudev`):
+### 3. Build on Linux (Ubuntu / Debian / Arch / Fedora)
+1. Install system dependencies for OpenGL rendering (`eframe`/`winit`), native file dialogs (`rfd` via GTK3), and serial ports (`serialport` via `libudev`):
 
    **Ubuntu / Debian:**
    ```bash
@@ -68,129 +72,129 @@ Instale o **Rust** via [rustup.rs](https://rustup.rs/).
    sudo pacman -S --needed base-devel pkgconf systemd gtk3 libxcb libxkbcommon mesa alsa-lib curl
    ```
 
-2. Clone e compile:
+2. Clone and build:
    ```bash
    git clone https://github.com/leandrop2103/axios24-rust.git
    cd axios24-rust
    cargo test
    cargo build --release
    ```
-3. O binário será gerado em:
+3. The binary will be generated at:
    ```bash
    ./target/release/axios24
    ```
 
-*(No Linux, o áudio do Multitrack, o RTA FFT e o MIDI USB funcionam nativamente via ALSA / PipeWire através de `cpal` e `midir`.)*
+*(On Linux, multitrack audio playback, FFT RTA, and USB MIDI operate natively via ALSA / PipeWire through `cpal` and `midir`.)*
 
-### 4. Compilar o Emulador de Hardware Virtual (Windows / Linux)
-Para compilar e executar o emulador de bancada para testes offline:
+### 4. Build the Virtual Hardware Emulator (Windows / Linux)
+To compile and run the offline testing emulator:
 ```powershell
 cargo run --release --bin axios24_emulator
-# ou apenas compilar:
+# or compile only:
 cargo build --release --bin axios24_emulator
 ```
-O executável otimizado será gerado em:
+The optimized executable will be generated at:
 ```text
 target\release\axios24_emulator.exe
 ```
 
-### 5. Compilar o App Android (Kotlin + Jetpack Compose)
-1. Certifique-se de ter o **JDK 17** e o **Android SDK** configurados.
-2. Na raiz do projeto, acesse a pasta `android` e execute:
+### 5. Build the Native Android App (Kotlin + Jetpack Compose)
+1. Make sure you have **JDK 17** and the **Android SDK** installed.
+2. In the project directory, navigate to the `android` folder and build:
 ```bash
 cd android
 ./gradlew assembleRelease
 ```
-O APK final assinado será gerado em:
+The signed APK will be generated at:
 ```text
 android/app/build/outputs/apk/release/app-release.apk
 ```
 
 ---
 
-## Emulador de Hardware Virtual (`axios24_emulator`)
+## Virtual Hardware Emulator (`axios24_emulator`)
 
-O repositório inclui um **Emulador de Hardware Virtual** de alta fidelidade desenvolvido em Rust puro. Ele permite desenvolver, depurar e testar tanto os nossos aplicativos (Desktop Rust e Android) quanto o próprio software oficial do fabricante, sem necessidade de estar fisicamente conectado à mesa de som.
+The repository includes a high-fidelity **Virtual Hardware Emulator** developed in pure Rust. It allows developers and sound engineers to design, debug, and test the Desktop Rust app, the Android app, and even the manufacturer's official software (`AX24E`), without having the physical mixer connected.
 
-### Recursos do Emulador:
-- **Rede e Protocolos em Tempo Real**:
-  - Escuta simultaneamente na porta **UDP 8086** (com respostas broadcast e unicast para a porta local padrão **1080**) e **TCP 8087**.
-  - Suporte opcional a bridge via porta serial COM virtual (ex.: `com0com`).
-  - Responde ao comando oficial de auto-descoberta (`0x1F` / `0x20` / `0x21`) identificando-se como `AX24E-EMU` com firmware `AX24E.25.11.01.001`.
-- **Layout Visual de Bancada**:
-  - **70% à esquerda**: 24 bolinhas de canais de entrada (`CH 1..24`).
-    - **Verde**: Canal ativo / desmutado.
-    - **Vermelho**: Canal mutado.
-    - **Anel Amarelo**: Canal em Solo.
-    - **Halo Pulsante e Nível**: Indicação visual imediata do fader e VU.
-  - **30% à direita**: 2 bolinhas de destaque para `MASTER L` e `MASTER R` com medição VU estéreo ao vivo em barra graduada.
-  - **Rodapé**: Barra horizontal com 8 bolinhas dedicadas aos canais auxiliares (`AUX 1..8`).
-- **Banco de 16 Cenas Integrado**:
-  - Gerenciamento completo de 16 cenas persistentes em arquivo local (`emulator_scenes.bin`).
-  - Suporta operações de recall de cena (`0x0A`) e salvamento de cena (`0x0B`), preservando nomes de canais, volumes, mutes, envios L/R e equalizações.
-- **Sincronização Multi-Cliente**:
-  - Qualquer fader, botão de mudo ou solo acionado no software em Rust, no app Android ou no software oficial da mesa atualiza o emulador instantaneamente e é propagado via broadcast (`0x25`) para os demais dispositivos conectados na rede local.
-
----
-
-## Como Usar
-
-1. **Ao abrir o aplicativo**, a janela **Conectar ao Mixer** aparece automaticamente e busca na sua rede interna (LAN) e no Wi-Fi da mesa (`172.14.10.1` / `192.168.4.1`).
-   - Se a mesa for encontrada, clique em **Conectar Agora**.
-   - Se quiser testar ou preparar uma cena offline, clique em **Entrar em MODO DEMO**.
-2. **Renomear e Colorir Canais**:
-   - Dê **duplo clique** no nome no topo do fader para editar na hora.
-   - Clique com o **botão direito** no canal para escolher entre as **32 cores**, renomear, copiar ou colar.
-3. **Pré / Pós Fader nos Auxiliares**:
-   - Na barra `FADERS:`, clique em `AUX1..AUX8` para entrar em *Sends on Fader*. Cada canal mostrará o botão **`PRE FADER` / `POST FADER`**.
-4. **Cenas `.scn`**:
-   - Vá em `CONFIG / CENAS > CENAS` para importar ou exportar arquivos `.scn` compatíveis com o software original.
+### Emulator Features:
+- **Real-Time Network & Protocols**:
+  - Listens simultaneously on **UDP 8086** (responding with broadcast and unicast packets back to local port **1080**) and **TCP 8087**.
+  - Optional bridging support with virtual COM serial ports (e.g., via `com0com`).
+  - Responds to official auto-discovery commands (`0x1F` / `0x20` / `0x21`) identifying as `AX24E-EMU` running firmware `AX24E.25.11.01.001`.
+- **Benchtop Rack Visual Layout**:
+  - **70% Left Panel**: 24 circular channel indicators (`CH 1..24`).
+    - **Green**: Active / Unmuted channel.
+    - **Red**: Muted channel.
+    - **Yellow Ring**: Channel in Solo.
+    - **Pulsing Halo & Meter**: Immediate real-time visual feedback for fader volume and VU level.
+  - **30% Right Panel**: 2 prominent circles for `MASTER L` and `MASTER R` accompanied by a dual graduated stereo VU meter.
+  - **Footer Bar**: Horizontal strip with 8 circular indicators dedicated to auxiliary channels (`AUX 1..8`).
+- **Integrated 16-Scene Bank**:
+  - Full persistence of 16 scenes stored in a local binary file (`emulator_scenes.bin`).
+  - Full support for official scene recall (`0x0A`) and scene save (`0x0B`) commands, preserving custom channel names, volumes, mutes, L/R assignments, and DSP parameters.
+- **Multi-Client Live Synchronization**:
+  - Adjusting any fader, mute, or solo in the Rust application, the Android app, or the manufacturer's official software updates the emulator instantaneously and is broadcast (`0x25`) to all other connected clients on the network.
 
 ---
 
-## Atalhos de Teclado
+## Getting Started
 
-Você também pode consultar esta lista dentro do aplicativo em **`CONFIG / CENAS > ATALHOS`**.
-
-### Faders, Canais e Mixagem
-| Atalho | Ação |
-| :--- | :--- |
-| `Seta Cima / Baixo` | Subir / Descer fader do canal selecionado (`±1.0 dB`) |
-| `Shift + Seta Cima / Baixo` | Ajuste fino de precisão no fader (`±0.1 dB`) |
-| `Seta Esquerda / Direita` | Selecionar canal anterior / próximo |
-| `0` ou `Home` | Resetar fader selecionado para Unity (`0.0 dB`) |
-| `M` | Mutar / Desmutar canal selecionado |
-| `S` | Ativar / Desativar Solo (`S`) no canal selecionado |
-| `L` | Ligar / Desligar envio do canal para o Master `L/R` |
-| `P` | Alternar `PRE / POST Fader` (em Sends on Fader `AUX`) |
-| `Ctrl + R` | Renomear canal selecionado inline |
-| `Ctrl + C` / `Ctrl + V` | Copiar / Colar configurações do canal selecionado |
-| `Ctrl + D` | Ativar / Desativar `DIM -20 dB` no Master `L/R` |
-| `Ctrl + Shift + S` | Limpar todos os Solos ativos (`CLR SOLO`) |
-
-### Camadas (Layers) e Sends on Fader
-| Atalho | Ação |
-| :--- | :--- |
-| `F1` .. `F7` | Camadas: `CH 1-8`, `CH 9-16`, `CH 17-24`, `DIGI/FX`, `AUX 1-8`, `DCA 1-4`, `TODOS 1-24` |
-| `Alt + 1` .. `Alt + 8` | Sends on Fader: controlar envio para `AUX 1` .. `AUX 8` |
-| `Alt + 0` ou `Esc` | Voltar faders para `MAIN L/R` (e fechar busca/modal) |
-
-### Abas Principais e Sistema
-| Atalho | Ação |
-| :--- | :--- |
-| `Ctrl + 1` .. `Ctrl + 6` | Navegar entre as abas (`Mixer`, `Editar`, `EQ/RTA`, `Efeitos`, `Player`, `Config`) |
-| `Ctrl + F` | Abrir / Fechar busca rápida de canais |
-| `F8` | Alternar Modo de Visão (`Normal` / `Analógico` / `Big Desktop`) |
-| `F9` | Ligar / Pausar Simulador `DEMO` |
-| `F10` | Abrir janela **Conectar ao Mixer / Rede** |
-| `F11` | Alternar **Tema Escuro (Dark) / Claro (Light)** |
-| `F12` | Bloquear Console (Tela de Senha) |
+1. **When launching the application**, the **Connect to Mixer** window appears automatically and searches your local network (LAN) and the mixer's Wi-Fi hotspot (`172.14.10.1` / `192.168.4.1`).
+   - If the mixer or emulator is discovered, click **Connect Now**.
+   - If you want to prepare or inspect a scene offline, click **Enter DEMO MODE**.
+2. **Renaming & Color-Coding Channels**:
+   - **Double-click** the channel name above the fader to edit it inline.
+   - **Right-click** any channel strip to select from **32 colors**, rename, copy, or paste channel settings.
+3. **Pre / Post Fader on Auxiliaries**:
+   - In the `FADERS:` selector bar, click `AUX1..AUX8` to switch to *Sends on Fader*. Each strip displays an interactive **`PRE FADER` / `POST FADER`** toggle.
+4. **Scenes (`.scn`)**:
+   - Navigate to `CONFIG / SCENES > SCENES` to import or export `.scn` files fully compatible with the official software.
 
 ---
 
-## Aviso Legal e Compatibilidade (MIT)
+## Keyboard Shortcuts
 
-Este projeto é uma reimplementação **independente e não oficial** em código aberto (licença **MIT**) desenvolvida com foco em **interoperabilidade** para proprietários do hardware Duonn Axios 24.  
-- Nenhum binário proprietário, código-fonte original ou marca registrada da fabricante é redistribuído neste repositório.  
-- O emulador de hardware virtual (`axios24_emulator`) é uma implementação original "clean-room" em Rust baseada em comunicação de rede (UDP/TCP), atuando estritamente em conformidade com as normas de interoperabilidade e termos do GitHub.  
-- "Duonn" e "Axios 24" são marcas registradas de seus respectivos proprietários, citadas apenas para fins de compatibilidade de hardware.
+You can also inspect this shortcut list inside the application via **`CONFIG / SCENES > SHORTCUTS`**.
+
+### Faders, Channels & Mixing
+| Shortcut | Action |
+| :--- | :--- |
+| `Up / Down Arrow` | Nudge fader on selected channel (`±1.0 dB`) |
+| `Shift + Up / Down Arrow` | Fine-precision fader adjustment (`±0.1 dB`) |
+| `Left / Right Arrow` | Select previous / next channel |
+| `0` or `Home` | Reset selected channel fader to Unity (`0.0 dB`) |
+| `M` | Mute / Unmute selected channel |
+| `S` | Toggle Solo (`S`) on selected channel |
+| `L` | Toggle channel routing to Master `L/R` |
+| `P` | Toggle `PRE / POST Fader` (in `AUX` Sends on Fader) |
+| `Ctrl + R` | Inline rename selected channel |
+| `Ctrl + C` / `Ctrl + V` | Copy / Paste settings of selected channel |
+| `Ctrl + D` | Toggle `DIM -20 dB` on Master `L/R` |
+| `Ctrl + Shift + S` | Clear all active solos (`CLR SOLO`) |
+
+### Layers & Sends on Fader
+| Shortcut | Action |
+| :--- | :--- |
+| `F1` .. `F7` | Switch Layers: `CH 1-8`, `CH 9-16`, `CH 17-24`, `DIGI/FX`, `AUX 1-8`, `DCA 1-4`, `ALL 1-24` |
+| `Alt + 1` .. `Alt + 8` | Sends on Fader: control sends to `AUX 1` .. `AUX 8` |
+| `Alt + 0` or `Esc` | Return faders to `MAIN L/R` (and dismiss search/dialogs) |
+
+### Main Tabs & System Controls
+| Shortcut | Action |
+| :--- | :--- |
+| `Ctrl + 1` .. `Ctrl + 6` | Switch main tabs (`Mixer`, `Edit`, `EQ/RTA`, `FX`, `Player`, `Config`) |
+| `Ctrl + F` | Open / Close quick channel search |
+| `F8` | Cycle View Mode (`Normal` / `Analog` / `Big Desktop`) |
+| `F9` | Start / Pause `DEMO` Audio Simulator |
+| `F10` | Open **Connect to Mixer / Network** dialog |
+| `F11` | Toggle **Dark Theme / Light Theme** |
+| `F12` | Lock Console (Password screen) |
+
+---
+
+## Legal Notice and Compatibility (MIT)
+
+This project is an **independent, unofficial** open-source reimplementation (under the **MIT license**) designed for **interoperability** for owners of the Duonn Axios 24 digital audio mixing console.  
+- No proprietary binaries, copyrighted firmware images, or original source code from the manufacturer are redistributed within this repository.  
+- The virtual hardware emulator (`axios24_emulator`) is an original clean-room implementation in Rust communicating via standard network sockets (UDP/TCP), fully complying with reverse-engineering interoperability standards and GitHub terms of service.  
+- "Duonn" and "Axios 24" are registered trademarks of their respective owners, referenced here solely for hardware compatibility purposes.
