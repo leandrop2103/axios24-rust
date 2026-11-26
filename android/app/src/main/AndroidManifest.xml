@@ -13,7 +13,7 @@
         android:label="Duonn Axios 24 Pro"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
         <activity
             android:name=".MainActivity"
             android:exported="true"
