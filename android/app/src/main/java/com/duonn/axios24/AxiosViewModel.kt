@@ -2,6 +2,8 @@ package com.duonn.axios24
 
 import android.app.Application
 import android.content.Context
+import android.net.wifi.WifiManager
+import android.os.Build
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -10,6 +12,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -20,6 +23,8 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -179,6 +184,53 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
 
     private val txQueue = LinkedBlockingQueue<ByteArray>()
     private val netRunning = AtomicBoolean(false)
+    private val connToken = AtomicInteger(0)
+    private val lastHwRxMs = AtomicLong(0L)
+    private val lastVuRxMs = AtomicLong(0L)
+    private var netJob: Job? = null
+    private var desiredProto: String? = null // "UDP" or "TCP"
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    /**
+     * Exact hardware VU meter registers from AX24E.25.11.01.001.exe (@ 0x00461200 & 0x00427DEC):
+     * - 0x02..0x0E (13 regs): Inputs 0..25 (CH1..CH24 + DIGI L/R), 2 signed int8 dB bytes/reg (low=even, high=odd)
+     * - 0x29..0x2A (2 regs):  FX 1..2, low signed int8 dB byte
+     * - 0x2B..0x2F (5 regs):  Outputs 0..9 (AUX1..AUX8 + MAIN L/R), 2 signed int8 dB bytes/reg (low=even, high=odd)
+     */
+    private val vuMeterRegs: List<Int> =
+        (0x02..0x0E).toList() + listOf(0x29, 0x2A) + (0x2B..0x2F).toList()
+
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        try {
+            if (wifiLock == null) {
+                val wm = getApplication<Application>().applicationContext
+                    .getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wm?.createWifiLock(mode, "Axios24:MixerWifiLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            wifiLock?.takeIf { !it.isHeld }?.acquire()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            wifiLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        disconnect()
+    }
 
     init {
         for (ch in 0..25) {
@@ -720,118 +772,244 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun onAppResumed() {
+        val proto = desiredProto ?: return
+        if (!netRunning.get() || !isConnected || netJob?.isActive != true) {
+            if (proto == "TCP") connectTcp(connectIp) else connectUdp(connectIp)
+        } else {
+            acquireWifiLock()
+            txQueue.offer(AxiosProtocol.buildFrame(0x00, byteArrayOf(0x00)))
+            txQueue.offer(AxiosProtocol.buildParamReadFrame(vuMeterRegs))
+            txQueue.offer(AxiosProtocol.buildParamReadFrame(listOf(0)))
+        }
+    }
+
     fun connectUdp(ip: String) {
-        disconnect()
-        connectIp = ip.trim()
+        val targetIp = ip.trim()
+        stopNetworkWorker(clearDesired = false)
+        connectIp = targetIp
+        desiredProto = "UDP"
         saveUserPrefs()
+        val myToken = connToken.incrementAndGet()
         netRunning.set(true)
         isConnected = true
+        lastHwRxMs.set(System.currentTimeMillis())
+        acquireWifiLock()
         for (i in 0 until channelMetersDb.size) channelMetersDb[i] = -90f
         connectionStatus = "UDP $connectIp:$UDP_REMOTE_PORT"
 
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                DatagramSocket().use { sock ->
-                    sock.soTimeout = 30
+        netJob = viewModelScope.launch(Dispatchers.IO) {
+            val discoverPkt = AxiosProtocol.buildFrame(0x00, byteArrayOf(0x00))
+            val keepAlive = AxiosProtocol.buildParamReadFrame(listOf(0))
+            val vuPoll = AxiosProtocol.buildParamReadFrame(vuMeterRegs)
+            val rtaPoll = AxiosProtocol.buildFrame(0x46, byteArrayOf(0x00, 0x1F))
+            val buf = ByteArray(2048)
+            var needsInitialSync = true
+
+            while (netRunning.get() && connToken.get() == myToken) {
+                try {
                     val addr = InetAddress.getByName(connectIp)
-                    val discoverPkt = AxiosProtocol.buildFrame(0x00, byteArrayOf(0x00))
-                    val keepAlive = AxiosProtocol.buildParamReadFrame(listOf(0))
-                    val rtaPoll = AxiosProtocol.buildFrame(0x46, byteArrayOf(0x00, 0x1F))
-                    sock.send(DatagramPacket(discoverPkt, discoverPkt.size, addr, UDP_REMOTE_PORT))
-                    sock.send(DatagramPacket(keepAlive, keepAlive.size, addr, UDP_REMOTE_PORT))
-                    val buf = ByteArray(1024)
-                    var ticks = 0
-
-                    // Automatically pull current scene (registers + channel names + scene names) upon connection
-                    readAllRegistersFromHardware()
-
-                    while (netRunning.get()) {
-                        var sentNow = 0
-                        while (sentNow < 4) {
-                            val pkt = txQueue.poll() ?: break
-                            sock.send(DatagramPacket(pkt, pkt.size, addr, UDP_REMOTE_PORT))
-                            sentNow++
+                    DatagramSocket().use { sock ->
+                        sock.broadcast = true
+                        sock.soTimeout = 25
+                        sock.send(DatagramPacket(discoverPkt, discoverPkt.size, addr, UDP_REMOTE_PORT))
+                        sock.send(DatagramPacket(keepAlive, keepAlive.size, addr, UDP_REMOTE_PORT))
+                        sock.send(DatagramPacket(vuPoll, vuPoll.size, addr, UDP_REMOTE_PORT))
+                        if (needsInitialSync) {
+                            readAllRegistersFromHardware()
+                            needsInitialSync = false
                         }
-                        sock.soTimeout = if (sentNow > 0) 8 else 18
-                        var gotAny = false
-                        for (i in 0 until 24) {
-                            try {
-                                val rx = DatagramPacket(buf, buf.size)
-                                sock.receive(rx)
-                                handleIncomingPacket(rx.data, rx.length)
-                                gotAny = true
-                                sock.soTimeout = 2
-                            } catch (_: Exception) {
-                                break
+
+                        var ticks = 0
+                        var reconnectingBanner = false
+                        while (netRunning.get() && connToken.get() == myToken) {
+                            var sentNow = 0
+                            while (sentNow < 4) {
+                                val pkt = txQueue.poll() ?: break
+                                sock.send(DatagramPacket(pkt, pkt.size, addr, UDP_REMOTE_PORT))
+                                sentNow++
+                            }
+                            sock.soTimeout = if (sentNow > 0) 8 else 18
+                            var gotAny = false
+                            for (i in 0 until 24) {
+                                try {
+                                    val rx = DatagramPacket(buf, buf.size)
+                                    sock.receive(rx)
+                                    handleIncomingPacket(rx.data, rx.length)
+                                    gotAny = true
+                                    sock.soTimeout = 2
+                                } catch (_: Exception) {
+                                    break
+                                }
+                            }
+                            if (gotAny && reconnectingBanner) {
+                                reconnectingBanner = false
+                                withContext(Dispatchers.Main) {
+                                    if (connToken.get() == myToken) {
+                                        connectionStatus = "UDP $connectIp:$UDP_REMOTE_PORT"
+                                    }
+                                }
+                            }
+                            ticks++
+                            // Poll real per-channel hardware VU meters (0x02..0x0E, 0x29..0x2F) every ~90ms
+                            if (sentNow == 0 && ticks % 5 == 0) {
+                                sock.send(DatagramPacket(vuPoll, vuPoll.size, addr, UDP_REMOTE_PORT))
+                            }
+                            // Poll 31-band RTA (0x46) every ~270ms
+                            if (sentNow == 0 && ticks % 15 == 0) {
+                                sock.send(DatagramPacket(rtaPoll, rtaPoll.size, addr, UDP_REMOTE_PORT))
+                            }
+                            // Heartbeat + stale link recovery every ~1.8s
+                            if (ticks % 100 == 0) {
+                                sock.send(DatagramPacket(keepAlive, keepAlive.size, addr, UDP_REMOTE_PORT))
+                                val silentMs = System.currentTimeMillis() - lastHwRxMs.get()
+                                if (silentMs > 4500L) {
+                                    sock.send(DatagramPacket(discoverPkt, discoverPkt.size, addr, UDP_REMOTE_PORT))
+                                    if (!reconnectingBanner) {
+                                        reconnectingBanner = true
+                                        withContext(Dispatchers.Main) {
+                                            if (connToken.get() == myToken) {
+                                                connectionStatus = "Reconectando UDP $connectIp..."
+                                            }
+                                        }
+                                    }
+                                    if (silentMs > 9000L) {
+                                        // Recreate UDP socket in case Android killed network route during sleep
+                                        break
+                                    }
+                                }
                             }
                         }
-                        ticks++
-                        if (sentNow == 0 && !gotAny && ticks % 6 == 0) {
-                            sock.send(DatagramPacket(rtaPoll, rtaPoll.size, addr, UDP_REMOTE_PORT))
-                        }
-                        if (ticks % 120 == 0) {
-                            sock.send(DatagramPacket(keepAlive, keepAlive.size, addr, UDP_REMOTE_PORT))
-                        }
                     }
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    isConnected = false
-                    connectionStatus = "Erro UDP: ${e.message}"
+                } catch (_: Exception) {
+                    if (netRunning.get() && connToken.get() == myToken) {
+                        withContext(Dispatchers.Main) {
+                            if (connToken.get() == myToken) {
+                                connectionStatus = "Reconectando UDP $connectIp..."
+                            }
+                        }
+                        delay(800)
+                    }
                 }
             }
         }
     }
 
     fun connectTcp(ip: String) {
-        disconnect()
-        connectIp = ip.trim()
+        val targetIp = ip.trim()
+        stopNetworkWorker(clearDesired = false)
+        connectIp = targetIp
+        desiredProto = "TCP"
         saveUserPrefs()
+        val myToken = connToken.incrementAndGet()
         netRunning.set(true)
         isConnected = true
+        lastHwRxMs.set(System.currentTimeMillis())
+        acquireWifiLock()
         for (i in 0 until channelMetersDb.size) channelMetersDb[i] = -90f
         connectionStatus = "TCP $connectIp:$TCP_REMOTE_PORT"
 
-        viewModelScope.launch(Dispatchers.IO) {
+        netJob = viewModelScope.launch(Dispatchers.IO) {
             val keepAlive = AxiosProtocol.buildKvFrame("DEVNAME=\n", false)
-            while (netRunning.get()) {
+            val vuPoll = AxiosProtocol.buildParamReadFrame(vuMeterRegs)
+            val rtaPoll = AxiosProtocol.buildFrame(0x46, byteArrayOf(0x00, 0x1F))
+            val acc = ArrayList<Byte>(4096)
+
+            while (netRunning.get() && connToken.get() == myToken) {
                 try {
                     Socket().use { s ->
                         s.connect(InetSocketAddress(connectIp, TCP_REMOTE_PORT), 2000)
-                        s.soTimeout = 30
+                        s.soTimeout = 25
                         s.tcpNoDelay = true
+                        s.keepAlive = true
                         val inp = s.getInputStream()
                         val out = s.getOutputStream()
-                        val buf = ByteArray(512)
+                        val buf = ByteArray(1024)
+                        acc.clear()
                         var ticks = 0
 
+                        withContext(Dispatchers.Main) {
+                            if (connToken.get() == myToken) {
+                                connectionStatus = "TCP $connectIp:$TCP_REMOTE_PORT"
+                            }
+                        }
+                        out.write(keepAlive)
+                        out.write(vuPoll)
                         readAllRegistersFromHardware()
 
-                        while (netRunning.get()) {
-                            while (true) {
+                        while (netRunning.get() && connToken.get() == myToken) {
+                            var sentNow = 0
+                            while (sentNow < 8) {
                                 val pkt = txQueue.poll() ?: break
                                 out.write(pkt)
+                                sentNow++
                             }
                             try {
                                 val n = inp.read(buf)
-                                if (n > 0) handleIncomingPacket(buf, n)
-                                else if (n < 0) break
-                            } catch (_: Exception) {
+                                if (n > 0) {
+                                    for (i in 0 until n) acc.add(buf[i])
+                                    while (true) {
+                                        val pos = acc.indexOfFirst { (it.toInt() and 0xFF) == 0x80 }
+                                        if (pos < 0) {
+                                            acc.clear()
+                                            break
+                                        }
+                                        if (pos > 0) acc.subList(0, pos).clear()
+                                        if (acc.size < 5) break
+                                        val b1 = acc[1].toInt() and 0xFF
+                                        val b2 = acc[2].toInt() and 0xFF
+                                        val crcOff = if (b1 == 0xFF && b2 == 0xFF) 0x106 else b1
+                                        val total = crcOff + 2
+                                        if (crcOff < 3 || total > 512) {
+                                            acc.removeAt(0)
+                                            continue
+                                        }
+                                        if (acc.size < total) break
+                                        val frame = ByteArray(total) { idx -> acc[idx] }
+                                        if (AxiosProtocol.parseFrame(frame, total) != null) {
+                                            acc.subList(0, total).clear()
+                                            handleIncomingPacket(frame, total)
+                                        } else {
+                                            acc.removeAt(0)
+                                        }
+                                    }
+                                } else if (n < 0) {
+                                    break
+                                }
+                            } catch (_: java.net.SocketTimeoutException) {
                             }
                             ticks++
+                            if (sentNow == 0 && ticks % 4 == 0) out.write(vuPoll)
+                            if (sentNow == 0 && ticks % 12 == 0) out.write(rtaPoll)
                             if (ticks % 80 == 0) out.write(keepAlive)
                         }
                     }
                 } catch (_: Exception) {
-                    delay(1200)
+                    if (netRunning.get() && connToken.get() == myToken) {
+                        withContext(Dispatchers.Main) {
+                            if (connToken.get() == myToken) {
+                                connectionStatus = "Reconectando TCP $connectIp..."
+                            }
+                        }
+                        delay(1000)
+                    }
                 }
             }
         }
     }
 
-    fun disconnect() {
+    private fun stopNetworkWorker(clearDesired: Boolean) {
+        if (clearDesired) desiredProto = null
         netRunning.set(false)
+        connToken.incrementAndGet()
+        netJob?.cancel()
+        netJob = null
         txQueue.clear()
+        releaseWifiLock()
+    }
+
+    fun disconnect() {
+        stopNetworkWorker(clearDesired = true)
         isConnected = false
         connectionStatus = "MODO DEMO (Offline)"
     }
@@ -876,17 +1054,60 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
         toast("Cena completa enviada para a Axios 24!")
     }
 
+    private fun applyVuMeterUpdate(flatId: Int, signedByte: Int) {
+        if (flatId !in 0 until channelMetersDb.size) return
+        val db = signedByte.toByte().toFloat().coerceIn(-90f, 3f)
+        val prev = channelMetersDb[flatId]
+        val smoothed = if (db >= prev) db else (prev - 4.5f).coerceAtLeast(db)
+        channelMetersDb[flatId] = smoothed
+        if (db >= -0.5f) channelClipHold[flatId] = true
+    }
+
     private suspend fun handleIncomingPacket(data: ByteArray, length: Int) {
         val parsed = AxiosProtocol.parseFrame(data, length) ?: return
+        lastHwRxMs.set(System.currentTimeMillis())
         val (cmd, payload) = parsed
         if (cmd == 0x03 || cmd == 0x06 || cmd == 0x25) {
             val updates = ArrayList<Pair<Int, Int>>()
+            val vuUpdates = ArrayList<Pair<Int, Int>>()
             var i = 0
             while (i + 4 <= payload.size) {
                 val r = ((payload[i].toInt() and 0xFF) shl 8) or (payload[i + 1].toInt() and 0xFF)
                 val v = ((payload[i + 2].toInt() and 0xFF) shl 8) or (payload[i + 3].toInt() and 0xFF)
-                updates.add(r to v)
+                if (r in 0x02..0x0E || r in 0x29..0x2F) {
+                    vuUpdates.add(r to v)
+                } else {
+                    updates.add(r to v)
+                }
                 i += 4
+            }
+            if (vuUpdates.isNotEmpty()) {
+                val hasNonZero = vuUpdates.any { it.second != 0 }
+                if (hasNonZero) {
+                    lastVuRxMs.set(System.currentTimeMillis())
+                    withContext(Dispatchers.Main) {
+                        for ((r, v) in vuUpdates) {
+                            if (v == 0) continue
+                            val lo = v and 0xFF
+                            val hi = (v ushr 8) and 0xFF
+                            when (r) {
+                                in 0x02..0x0E -> {
+                                    val ch0 = (r - 0x02) * 2
+                                    applyVuMeterUpdate(ch0, lo)
+                                    if (ch0 + 1 <= 25) applyVuMeterUpdate(ch0 + 1, hi)
+                                }
+                                0x29, 0x2A -> {
+                                    applyVuMeterUpdate(26 + (r - 0x29), lo)
+                                }
+                                in 0x2B..0x2F -> {
+                                    val out0 = (r - 0x2B) * 2
+                                    applyVuMeterUpdate(28 + out0, lo)
+                                    if (out0 + 1 <= 9) applyVuMeterUpdate(28 + out0 + 1, hi)
+                                }
+                            }
+                        }
+                    }
+                }
             }
             if (updates.isNotEmpty()) {
                 withContext(Dispatchers.Main) {
@@ -919,11 +1140,14 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         } else if (cmd == 0x46 && payload.size >= 3) {
-            val peak = payload.drop(2).maxOfOrNull { it.toInt() and 0xFF } ?: 0
-            val masterDb = if (peak <= 1) -90f else (-60f + (peak / 100f) * 60f).coerceIn(-90f, 2f)
-            withContext(Dispatchers.Main) {
-                channelMetersDb[36] = masterDb
-                channelMetersDb[37] = masterDb
+            // Fallback for MAIN L/R meter when only 0x46 RTA is available (e.g. emulator)
+            if (System.currentTimeMillis() - lastVuRxMs.get() > 500L) {
+                val peak = payload.drop(2).maxOfOrNull { it.toInt() and 0xFF } ?: 0
+                val masterDb = if (peak <= 1) -90f else (-60f + (peak / 100f) * 60f).coerceIn(-90f, 2f)
+                withContext(Dispatchers.Main) {
+                    channelMetersDb[36] = masterDb
+                    channelMetersDb[37] = masterDb
+                }
             }
         } else if (cmd != 0x39 && cmd != 0x00) {
             val preview = payload.take(12).joinToString(" ") { String.format("%02X", it.toInt() and 0xFF) }
@@ -951,6 +1175,13 @@ class AxiosViewModel(app: Application) : AndroidViewModel(app) {
                             val lvl = (-18f + wave + fader * 0.65f).coerceIn(-85f, 2f)
                             channelMetersDb[i] = lvl
                             if (lvl >= -0.5f) channelClipHold[i] = true
+                        }
+                    }
+                } else if (System.currentTimeMillis() - lastVuRxMs.get() > 350L) {
+                    for (i in 0 until 42) {
+                        val cur = channelMetersDb[i]
+                        if (cur > -90f) {
+                            channelMetersDb[i] = (cur - 3.0f).coerceAtLeast(-90f)
                         }
                     }
                 }

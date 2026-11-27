@@ -14,6 +14,16 @@ pub const UDP_REMOTE_PORT: u16 = 8086;
 pub const TCP_REMOTE_PORT: u16 = 8087;
 pub const SERIAL_BAUD: u32 = 115200;
 
+/// Real hardware per-channel VU meter registers (from AX24E.25.11.01.001.exe @ 0x461200):
+/// - 0x02..=0x0E: Inputs 0..25 (CH1..24 + DIGI L/R), 2 signed i8 dB bytes/reg (low=even, high=odd)
+/// - 0x29..=0x2A: FX 1..2, low signed i8 dB byte
+/// - 0x2B..=0x2F: Outputs 0..9 (AUX1..8 + MAIN L/R), 2 signed i8 dB bytes/reg (low=even, high=odd)
+pub const VU_METER_REGS: [u16; 20] = [
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+    0x29, 0x2A,
+    0x2B, 0x2C, 0x2D, 0x2E, 0x2F,
+];
+
 /// Known default factory IPs used across Duonn Axios 24 / 16 / 32 firmware revisions
 pub const DUONN_FACTORY_IPS: [(&str, &str); 4] = [
     ("172.14.10.1", "Axios 24 (Padrão Novo)"),
@@ -530,10 +540,12 @@ impl HardwareLink {
                             let target = format!("{}:{}", ip_clean, port);
                             let discover_pkt = build_frame(0x00, &[0x00]);
                             let keepalive = build_param_read_frame(&[0]);
+                            let vu_poll = build_param_read_frame(&VU_METER_REGS);
                             let rta_poll = build_frame(0x46, &[0x00, 0x1F]);
-                            // Immediately send official discovery + heartbeat so mixer & firewall register this UDP session
+                            // Immediately send official discovery + heartbeat + VU poll so mixer & firewall register this UDP session
                             let _ = s.send_to(&discover_pkt, &target);
                             let _ = s.send_to(&keepalive, &target);
+                            let _ = s.send_to(&vu_poll, &target);
                             let _ = tx_in.send(NetEvent::Connected(format!(
                                 "UDP {} (Keep-Alive Ativo)",
                                 target
@@ -565,12 +577,17 @@ impl HardwareLink {
                                             got_any = true;
                                             let _ = s.set_read_timeout(Some(Duration::from_millis(1)));
                                         }
+                                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
                                         Err(_) => break,
                                     }
                                 }
                                 ticks = ticks.wrapping_add(1);
-                                // Poll live hardware VU/RTA (0x46) every ~120ms when queue is idle
-                                if sent_this_tick == 0 && !got_any && ticks % 8 == 0 {
+                                // Poll live per-channel hardware VU meters (0x02..0x0E, 0x29..0x2F) every ~90ms when queue is idle
+                                if sent_this_tick == 0 && ticks % 6 == 0 {
+                                    let _ = s.send_to(&vu_poll, &target);
+                                }
+                                // Poll live hardware RTA (0x46) every ~180ms when queue is idle
+                                if sent_this_tick == 0 && !got_any && ticks % 12 == 0 {
                                     let _ = s.send_to(&rta_poll, &target);
                                 }
                                 // Send UDP heartbeat every ~2.5s to keep Wi-Fi/Router NAT alive
@@ -932,39 +949,120 @@ pub fn detect_local_ipv4() -> Option<std::net::Ipv4Addr> {
     None
 }
 
-/// Broadcasts official 0x00 (`80 04 00 00 25 68`) + 0x39 UDP discovery probes on port 8086 across localhost, LAN subnet, Wi-Fi AP & factory IPs
+/// Broadcasts official 0x00 (`80 04 00 00 25 68`) + 0x39 UDP discovery probes on port 8086 across LAN subnet, Wi-Fi AP, factory IPs & localhost.
+/// Resilient to Windows WSAECONNRESET (os error 10054) ICMP port-unreachable errors when localhost:8086 is not running the emulator.
 pub fn probe_udp_devices() -> Vec<DiscoveredDevice> {
-    let mut found = Vec::new();
-    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-        let _ = sock.set_broadcast(true);
-        let _ = sock.set_read_timeout(Some(Duration::from_millis(350)));
-        let probe_official = build_frame(0x00, &[0x00]); // Exact 80 04 00 00 25 68 from AX24E.25.11.01.001.exe
-        let probe_kv = build_kv_frame("DEVNAME=\nFW_VER=\nFW_BUILD=\n", false);
-        let mut targets: Vec<String> = vec!["127.0.0.1".to_string(), "255.255.255.255".to_string()];
-        if let Some(local_ip) = detect_local_ipv4() {
-            targets.push(local_ip.to_string());
-            let octets = local_ip.octets();
-            targets.push(format!("{}.{}.{}.255", octets[0], octets[1], octets[2]));
-        }
-        for &(ip, _) in &DUONN_FACTORY_IPS {
-            targets.push(ip.to_string());
-        }
-        for t in &targets {
-            let _ = sock.send_to(&probe_official, (t.as_str(), UDP_REMOTE_PORT));
-            let _ = sock.send_to(&probe_kv, (t.as_str(), UDP_REMOTE_PORT));
-        }
-        let mut buf = [0u8; 512];
-        while let Ok((n, src)) = sock.recv_from(&mut buf) {
-            if let Some((cmd, payload)) = parse_frame(&buf[..n]) {
-                if let Some((name, fw)) = parse_discovery_reply(cmd, payload) {
-                    let ip_str = src.ip().to_string();
-                    if !found.iter().any(|d: &DiscoveredDevice| d.ip == ip_str) {
-                        found.push(DiscoveredDevice {
-                            name,
-                            ip: ip_str,
-                            fw_version: fw,
-                        });
+    use std::io::ErrorKind;
+    use std::time::Instant;
+
+    let mut found: Vec<DiscoveredDevice> = Vec::new();
+    let probe_official = build_frame(0x00, &[0x00]); // Exact 80 04 00 00 25 68 from AX24E.25.11.01.001.exe
+    let probe_kv = build_kv_frame("DEVNAME=\nFW_VER=\nFW_BUILD=\n", false);
+
+    // Collect distinct local IPv4 addresses via routing probes so multi-NIC Windows PCs (Wi-Fi + Ethernet + VPN) broadcast on all active interfaces
+    let mut local_ips: Vec<std::net::Ipv4Addr> = Vec::new();
+    for probe_dst in [
+        "172.14.10.1:8086",
+        "192.168.4.1:8086",
+        "192.168.1.1:8086",
+        "192.168.0.1:8086",
+        "10.0.0.1:8086",
+        "8.8.8.8:80",
+    ] {
+        if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+            if s.connect(probe_dst).is_ok() {
+                if let Ok(SocketAddr::V4(addr)) = s.local_addr() {
+                    let ip = *addr.ip();
+                    if !ip.is_loopback() && !ip.is_unspecified() && !local_ips.contains(&ip) {
+                        local_ips.push(ip);
                     }
+                }
+            }
+        }
+    }
+
+    let mut targets: Vec<String> = vec!["255.255.255.255".to_string()];
+    for ip in &local_ips {
+        let o = ip.octets();
+        let bcast = format!("{}.{}.{}.255", o[0], o[1], o[2]);
+        if !targets.contains(&bcast) {
+            targets.push(bcast);
+        }
+    }
+    for &(ip, _) in &DUONN_FACTORY_IPS {
+        let s = ip.to_string();
+        if !targets.contains(&s) {
+            targets.push(s);
+        }
+    }
+    // Probe localhost LAST (or on its own) so closed localhost:8086 never blocks LAN packets
+    targets.push("127.0.0.1".to_string());
+
+    // Bind primary wildcard socket + per-interface sockets so Windows broadcasts reach Wi-Fi even if Ethernet/VPN is default
+    let mut sockets: Vec<UdpSocket> = Vec::new();
+    if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+        let _ = s.set_broadcast(true);
+        let _ = s.set_read_timeout(Some(Duration::from_millis(40)));
+        sockets.push(s);
+    }
+    for ip in &local_ips {
+        if let Ok(s) = UdpSocket::bind(SocketAddr::from((*ip, 0))) {
+            let _ = s.set_broadcast(true);
+            let _ = s.set_read_timeout(Some(Duration::from_millis(40)));
+            sockets.push(s);
+        }
+    }
+    if sockets.is_empty() {
+        return found;
+    }
+
+    let send_burst = |socks: &[UdpSocket]| {
+        for (idx, sock) in socks.iter().enumerate() {
+            for t in &targets {
+                // Only send 127.0.0.1 from the wildcard socket
+                if idx > 0 && t == "127.0.0.1" {
+                    continue;
+                }
+                let _ = sock.send_to(&probe_official, (t.as_str(), UDP_REMOTE_PORT));
+                let _ = sock.send_to(&probe_kv, (t.as_str(), UDP_REMOTE_PORT));
+            }
+        }
+    };
+
+    send_burst(&sockets);
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(900);
+    let mut second_burst_sent = false;
+    let mut buf = [0u8; 512];
+
+    while Instant::now() < deadline {
+        if !second_burst_sent && start.elapsed() >= Duration::from_millis(320) {
+            send_burst(&sockets);
+            second_burst_sent = true;
+        }
+        for sock in &sockets {
+            loop {
+                match sock.recv_from(&mut buf) {
+                    Ok((n, src)) => {
+                        if let Some((cmd, payload)) = parse_frame(&buf[..n]) {
+                            if let Some((name, fw)) = parse_discovery_reply(cmd, payload) {
+                                let ip_str = src.ip().to_string();
+                                if !found.iter().any(|d| d.ip == ip_str) {
+                                    found.push(DiscoveredDevice {
+                                        name,
+                                        ip: ip_str,
+                                        fw_version: fw,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // CRITICAL on Windows: closed UDP targets (e.g. 127.0.0.1:8086 when emulator is off)
+                    // raise WSAECONNRESET (ConnectionReset). Ignore it and keep listening for LAN replies!
+                    Err(e) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::Interrupted => {
+                        continue;
+                    }
+                    Err(_) => break,
                 }
             }
         }

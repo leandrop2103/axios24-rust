@@ -2,7 +2,7 @@
   <strong>English</strong> • <a href="README.pt-BR.md">🇧🇷 Versão em Português (pt-BR)</a>
 </p>
 
-# Duonn Axios 24 — DS Mixer Pro (Rust Edition & Android) `v0.4.8`
+# Duonn Axios 24 — DS Mixer Pro (Rust Edition & Android) `v0.4.9`
 
 Modern, ultra-lightweight (~2.5 MB), open-source **Rust** (Windows / Linux) and **Native Android** (Kotlin + Jetpack Compose) remote control suite for the **Duonn Axios 24** digital audio mixing console (via LAN/Wi-Fi UDP/TCP or USB Serial). Features a sleek user interface inspired by **DS Mixer**, real-time EQ/Gate/Compressor curves, **Real FFT RTA Spectrum Analyzer**, 100% compatible official `.scn` scene management, an **Integrated Virtual Hardware Emulator**, and **GitHub hot auto-updates**.
 

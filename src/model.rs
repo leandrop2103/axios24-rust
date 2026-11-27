@@ -2617,6 +2617,48 @@ impl Axios24State {
                     }
                     let layout = self.hw_link.firmware_layout;
                     for (reg, val) in pairs {
+                        // Real hardware per-channel VU meter registers (from AX24E @ 0x461200):
+                        // 0x02..=0x0E = Inputs 0..25, 0x29..=0x2A = FX 1..2, 0x2B..=0x2F = AUX 1..8 + MAIN L/R
+                        if matches!(reg, 0x02..=0x0E | 0x29..=0x2F) {
+                            if val != 0 {
+                                let lo_db = ((val & 0xFF) as u8 as i8 as f32).clamp(-90.0, 3.0);
+                                let hi_db = (((val >> 8) & 0xFF) as u8 as i8 as f32).clamp(-90.0, 3.0);
+                                let mut apply = |flat_id: usize, db: f32| {
+                                    if flat_id < self.channel_meters_db.len() {
+                                        let prev = self.channel_meters_db[flat_id];
+                                        self.channel_meters_db[flat_id] = if db >= prev {
+                                            db
+                                        } else {
+                                            (prev - 4.5).max(db)
+                                        };
+                                        if db >= -0.5 {
+                                            self.channel_clip_hold[flat_id] = true;
+                                        }
+                                    }
+                                };
+                                match reg {
+                                    0x02..=0x0E => {
+                                        let ch0 = ((reg - 0x02) * 2) as usize;
+                                        apply(ch0, lo_db);
+                                        if ch0 + 1 <= 25 {
+                                            apply(ch0 + 1, hi_db);
+                                        }
+                                    }
+                                    0x29 | 0x2A => {
+                                        apply(26 + (reg - 0x29) as usize, lo_db);
+                                    }
+                                    0x2B..=0x2F => {
+                                        let out0 = ((reg - 0x2B) * 2) as usize;
+                                        apply(28 + out0, lo_db);
+                                        if out0 + 1 <= 9 {
+                                            apply(28 + out0 + 1, hi_db);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(r) = layout.from_device(reg) {
                             self.regs[r as usize] = val;
                         }
@@ -2649,8 +2691,12 @@ impl Axios24State {
                     } else {
                         (-60.0 + (peak_hw / 100.0) * 60.0).clamp(-90.0, 2.0)
                     };
-                    self.channel_meters_db[36] = master_db;
-                    self.channel_meters_db[37] = master_db;
+                    if self.channel_meters_db[36] <= -89.0 && master_db > -89.0 {
+                        self.channel_meters_db[36] = master_db;
+                    }
+                    if self.channel_meters_db[37] <= -89.0 && master_db > -89.0 {
+                        self.channel_meters_db[37] = master_db;
+                    }
                 }
                 NetEvent::DeviceDiscovered(dev) => {
                     got_hw_packet = true;

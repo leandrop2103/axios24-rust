@@ -42,6 +42,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             MaterialTheme(
@@ -77,6 +78,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         enableImmersiveFullscreen()
         window.decorView.post { enableImmersiveFullscreen() }
+        vm.onAppResumed()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
